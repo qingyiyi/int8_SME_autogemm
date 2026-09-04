@@ -1,0 +1,95 @@
+# Generated SME INT8 CBLAS build.  It never changes the reference .S files.
+
+REF_ROOT ?= /path/to/int8gemm-kblas
+ASM_DIR ?= $(REF_ROOT)/arm64_sme
+BISHENG_ROOT ?= /data1/env/HPCKit_26.0.RC1/HPCKit/latest/compiler/bisheng
+SME_CC ?= $(BISHENG_ROOT)/bin/BiSheng-clang
+CC := $(SME_CC)
+
+TARGET ?= libint8gemm_autogemm.so
+BUILD_DIR ?= build
+DRIVER_SRC := cblas_gemm_s8s8s32_autogemm.c
+DRIVER_OBJ := $(BUILD_DIR)/cblas_gemm_s8s8s32_autogemm.o
+ASM_BUILD_DIR := $(BUILD_DIR)/asm
+
+CFLAGS := -O2 -fPIC -Wall \
+  -mllvm=-disable-lsr \
+  -mllvm=-aarch64-insert-extract-base-cost=3 \
+  -mllvm=-disable-aggressive-fabs-opt=true \
+  -mllvm=-disable-folding-shifts-loads=true \
+  -mllvm=-disable-small-spreads-precision-increase=true \
+  -mllvm=-ignore-tti-inline-compatible=true
+ARCH_FLAGS := -march=armv8.6-a+sve+sve2+sme-f64f64+fp16+bf16
+DEFINES := -DUSE_SME_OPT -DINT8_SME -DUSE_SIMPLE_THREADED_LEVEL3 \
+  -DCOMPSIZE=1 -DPARAM_CONF_KP920F_SME
+OPENMP := -fopenmp=libomp
+INCLUDES := -I$(REF_ROOT) -I$(ASM_DIR) -I$(REF_ROOT)/include
+ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(DEFINES) $(OPENMP) $(INCLUDES)
+
+# This list intentionally mirrors the reference Makefile.  If the validated
+# remote source uses a different ASM directory, pass ASM_DIR=/that/directory.
+ASM_OBJS := \
+  $(ASM_BUILD_DIR)/gemm_sme_nt.o \
+  $(ASM_BUILD_DIR)/gemm_sme_nn.o \
+  $(ASM_BUILD_DIR)/gemm_tcopy_zip.o \
+  $(ASM_BUILD_DIR)/gemm_ncopy_unzip.o
+
+# Preferred baseline mode: pass the four validated reference objects through
+# KERNEL_OBJECTS.  This replaces only the generated C driver and leaves the
+# existing SME kernel/packer code bit-for-bit identical to the reference build.
+# When empty, the Makefile recompiles the source list above for later variants.
+KERNEL_OBJECTS ?=
+ifneq ($(strip $(KERNEL_OBJECTS)),)
+LINK_ASM_OBJS := $(KERNEL_OBJECTS)
+else
+LINK_ASM_OBJS := $(ASM_OBJS)
+endif
+
+.PHONY: all check print-config clean
+
+all: $(TARGET)
+
+$(TARGET): $(DRIVER_OBJ) $(LINK_ASM_OBJS)
+
+	$(CC) -shared $(OPENMP) -o $@ $^ -lm -lpthread -lnuma
+
+$(DRIVER_OBJ): $(DRIVER_SRC)
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -c $< -o $@
+
+$(ASM_BUILD_DIR)/gemm_tcopy_zip.o: $(ASM_DIR)/gemm_tcopy_zip.S
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_itcopy -DASMFNAME=int8_sme_gemm_itcopy_ -DNAME=int8_sme_gemm_itcopy_ -DCNAME=int8_sme_gemm_itcopy -c $< -o $@
+
+$(ASM_BUILD_DIR)/gemm_ncopy_unzip.o: $(ASM_DIR)/gemm_ncopy_unzip.S
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_oncopy -DASMFNAME=int8_sme_gemm_oncopy_ -DNAME=int8_sme_gemm_oncopy_ -DCNAME=int8_sme_gemm_oncopy -c $< -o $@
+
+$(ASM_BUILD_DIR)/gemm_sme_nn.o: $(ASM_DIR)/gemm_sme_nn.S
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nn -DASMFNAME=int8_sme_gemm_kernel_nn_ -DNAME=int8_sme_gemm_kernel_nn_ -DCNAME=int8_sme_gemm_kernel_nn -c $< -o $@
+
+$(ASM_BUILD_DIR)/gemm_sme_nt.o: $(ASM_DIR)/gemm_sme_nt.S
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nt -DASMFNAME=int8_sme_gemm_kernel_nt_ -DNAME=int8_sme_gemm_kernel_nt_ -DCNAME=int8_sme_gemm_kernel_nt -c $< -o $@
+
+check: $(TARGET)
+
+	@nm -D $(TARGET) | awk '$$2 ~ /^[TW]$$/ && $$3 == "cblas_gemm_s8s8s32" { found = 1 } END { exit(found ? 0 : 1) }'
+
+print-config:
+
+	@echo "REF_ROOT=$(REF_ROOT)"
+	@echo "ASM_DIR=$(ASM_DIR)"
+	@echo "CC=$(CC)"
+	@echo "TARGET=$(TARGET)"
+	@echo "KERNEL_OBJECTS=$(KERNEL_OBJECTS)"
+
+clean:
+
+	rm -rf $(BUILD_DIR) $(TARGET)

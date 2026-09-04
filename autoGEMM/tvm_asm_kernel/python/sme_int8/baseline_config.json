@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "kp920f_sme_int8_baseline",
+  "abi": {
+    "export": "cblas_gemm_s8s8s32",
+    "kernel": "int8_sme_gemm_kernel_nn",
+    "a_packer": "int8_sme_gemm_itcopy",
+    "b_packer": "int8_sme_gemm_oncopy"
+  },
+  "driver": {
+    "threads_m": 32,
+    "threads_n": 1,
+    "p": 256,
+    "q": 2048,
+    "r": 8192,
+    "jblock": 32,
+    "region_align": 4,
+    "b_packing": "reference_two_phase"
+  },
+  "shapes": [
+    [2048, 2048, 2048],
+    [2048, 4096, 2048],
+    [2048, 8192, 2048],
+    [4096, 2048, 2048],
+    [4096, 4096, 2048],
+    [4096, 8192, 2048],
+    [8192, 2048, 2048],
+    [8192, 4096, 2048],
+    [8192, 8192, 2048]
+  ]
+}
