@@ -1,0 +1,28 @@
+phase: discover
+status: complete
+language: zh-CN
+workflow_kind: analysis
+analysis_kind: repo_system
+audience:
+  background: "熟悉 C/C++，不熟悉 TVM/AutoTVM"
+  teaching_language: zh-CN
+confirmed_choices:
+  asm_depth: conceptual_register_pipeline_tail
+  tvm_entry: minimal_example_first
+  interaction: pause_after_each_milestone
+  anchor_shape: "M=26,N=36,K=64"
+  sme_comparison: concrete_source_comparison
+  final_assessment: "评估修改 AutoGEMM 支持 SME kernel 自动生成的难度"
+verification:
+  static_host: true
+  target_execution_available: false
+  per_milestone: "源码命令 + 理解检查题 + 用户确认"
+constraints:
+  active_sme_contract: "s8 x s8 -> s32, zero-point=0"
+  protected_files:
+    - .pipeline/state.yaml
+    - .pipeline/cycle.yaml
+    - .pipeline/rules.yaml
+open_questions:
+  - "是否将固定 16x16 SME external-call MVP 作为第一阶段"
+  - "目标机工具链、SVL/HWCAP2 probe 与许可证证据"

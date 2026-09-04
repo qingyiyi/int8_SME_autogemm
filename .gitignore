@@ -1,0 +1,6 @@
+# Hypo-Workflow runtime state and generated OpenCode adapters.
+/.pipeline/
+/.opencode/
+/AGENTS.md
+/opencode.json
+/tui.json

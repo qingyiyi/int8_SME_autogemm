@@ -1,0 +1,42 @@
+phase: decompose
+status: proposed
+language: zh-CN
+milestones:
+  - id: M1
+    title: "GEMM 与最小 TVM 心智模型"
+    objective: "从 C/C++ GEMM 出发理解 placeholder、compute、reduce_axis、schedule、split、reorder、tensorize。"
+    validation: "运行/阅读最小示例并用 rg 定位对应 API；能解释一个输出元素的计算和一个 schedule 变换。"
+    artifacts: ["最小 TVM 伪代码/图", "术语表", "源码定位命令"]
+    non_goals: ["不安装 TVM", "不改仓库代码"]
+  - id: M2
+    title: "论文架构与微内核生成"
+    objective: "把 Fig.1、Eq.(1)-(3)、AI/寄存器块和生成器输入输出对应到 NEON/SVE 源码。"
+    validation: "追踪一个 tile 的生成参数、寄存器分配、FMA 累加和 C 写回；区分论文伪代码与真实生成器。"
+    artifacts: ["论文-源码映射图", "NEON/SVE 生成路径", "理解检查题"]
+    non_goals: ["不声称论文全部性能模型已在仓库实现"]
+  - id: M3
+    title: "固定形状的 AutoTVM 端到端追踪"
+    objective: "以 M=26,N=36,K=64 从 tune.sh 走到 task/config、PackedB、TensorIntrin、call_extern、LLVM 和 DSO。"
+    validation: "逐段执行 rg/nl/静态 Python 检查，形成输入-输出证据链；目标机命令单列为待执行。"
+    artifacts: ["端到端时序图", "config knob 表", "复现命令清单"]
+    non_goals: ["不在 x86 主机伪造 Arm 性能结果"]
+  - id: M4
+    title: "流水优化、RBSA 与动态微分块"
+    objective: "解释 rotating register allocation、prologue/main/epilogue fusion、RBSA，并指出 DMT/AI 模型在当前源码中的可见缺口。"
+    validation: "对照 pipeline/RBSA experiment 脚本和论文 Algorithm 1；给出‘已实现/部分实现/缺失’矩阵。"
+    artifacts: ["流水阶段交互图", "DMT 对照图", "论文主张证据等级表"]
+    non_goals: ["不把 MRSA/NRSA 余数逻辑等同于完整 DMT DP"]
+  - id: M5
+    title: "评测、正确性与复现边界"
+    objective: "解释 pack offline/online、TVM time evaluator、C++ benchmark、正确性容差和日志/工具链风险。"
+    validation: "静态检查 evaluate.py、benchmark.cpp、Makefile 与脚本；列出目标机闭环命令和预期证据。"
+    artifacts: ["测量口径图", "风险清单", "目标机验证 checklist"]
+    non_goals: ["不将论文数字直接当作当前机器结果"]
+  - id: M6
+    title: "INT8 SME 对照与自动生成可行性评估"
+    objective: "将 SME 汇编/packing/kernel ABI 与 AutoGEMM 后端逐项对照，评估固定 kernel 接入、参数化生成和完整 AutoTVM 搜索的难度。"
+    validation: "检查 SME 源码中的 ZA/MOPA、SVL、K padding、corner、C+=语义和导出符号；输出分阶段改造路线、阻塞项、工作量等级和验收证据。"
+    artifacts: ["差异矩阵", "MVP 架构图", "难度/风险评估报告", "后续实验计划"]
+    non_goals: ["不在本轮直接改造 AutoGEMM", "不绕过许可证和目标机能力验证"]
+proposed_preset: analysis
+checkpoint: "等待用户确认后进入 Generate"

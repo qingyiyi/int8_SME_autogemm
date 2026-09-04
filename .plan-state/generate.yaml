@@ -1,0 +1,22 @@
+phase: generate
+status: complete
+language: zh-CN
+teaching_only: true
+implementation_pipeline_mutation: false
+artifacts:
+  design_spec: .pipeline/design-spec.md
+  discover_state: .plan-state/discover.yaml
+  decompose_state: .plan-state/decompose.yaml
+  teaching_flow: .plan-state/teaching-flow.md
+  interactive_visualization: /rjs/cxz/.codex/visualizations/2026/08/19/01a017d0-ae32-7011-a0c4-562a9f8168cd/autogemm-teaching-map.html
+anchor_shape: M=26,N=36,K=64
+milestone_count: 6
+validation_mode:
+  host: static_only
+  target_arm: pending
+  interaction: pause_after_each_milestone
+assessment_layers:
+  - fixed_16x16_external_call_mvp
+  - parameterized_sme_generator
+  - full_autotvm_and_performance_model
+checkpoint: confirm_start_required
