@@ -4,3 +4,6 @@
 /AGENTS.md
 /opencode.json
 /tui.json
+/.codex/
+/.agents/
+/.plan-state/
