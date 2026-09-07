@@ -4,7 +4,7 @@
     int8_sme_gemm_kernel_nn                                       \
     (M, N, K, SA, LDA, ALPHA[0], (FLOAT *)SB, LDB, (int32_t *)(C) + ((X) + (Y) * (LDC)) * COMPSIZE, LDC, BUF)
 
-
+//WARNING: 可以改成16X2
 int nthreadsM = 32;
 int nthreadsN = 1;
 
@@ -57,6 +57,7 @@ typedef struct {
 } AllocHead;
 
 #define BLAS_MEM_ALIGN 4096
+
 /*************** util func ********************/
 
 
@@ -65,6 +66,7 @@ typedef struct {
 #define LEVEL3_GEMM_R 8192
 #define LEVEL3_GEMM_Q 2048
 // P 是M维度， Q是K维度，R是N维度
+// WARNING: 可以改成256
 #define LEVEL3_GEMM_P 256
 static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG mask, const BLASLONG *rangeM, const BLASLONG *rangeN)
 {
@@ -110,19 +112,14 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
             }
 #pragma omp barrier
             if (mask & GEMM_PB_MASK) {
-                
-                int minJJ = Jblock;
-                int myJ = Jblock * mypos;
-                PACK_B(minL, minJJ, b, ldb, ls, js + myJ, bufbb + minL * myJ, args->ob);
-                int Jleft = minJ - Jblock * threads ;
-                myJ = (Jleft + threads - 1) / threads;
-                if (myJ * mypos +myJ > Jleft) {
-                    myJ = Jleft - myJ * mypos;
+                int myJ = (minJ + threads - 1) / threads;
+                if (myJ * mypos > nTo) {
+                    myJ = nTo - myJ * mypos;
                 }
-                PACK_B(minL, myJ, b, ldb, ls, js + Jblock * threads + myJ * mypos, bufbb + minL * (Jblock * threads + myJ * mypos) , args->ob);
-                bufferB[mypos] = bufbb;            
+                PACK_B(minL, myJ, b, ldb, ls, js + myJ * mypos, bufbb + nypos*minL*minJ + minL * (myJ * mypos) , args->ob);
+                bufferB[mypos] = bufbb;         
             }
-// #pragma omp barrier
+#pragma omp barrier
             for (is = mFrom; is < mTo; is += minI) {
                 minI = mTo - is;
                 if (minI >= LEVEL3_GEMM_P) {
@@ -133,33 +130,14 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
                 
                 //! start kernel
                 int minJJ = Jblock;
-                int start_off = js + minJJ * mypos;
+                int start_off = js; //js + minJJ * mypos;
 
-                for(int jj = start_off; jj < js + minJ; jj+= minJJ) {
-                   if(jj > start_off && is == mFrom) 
-                   {
-                        volatile int flag = 1;
-
-                        while(flag) {
-                            flag =0;
-                            for(int id = 0; id < threads; id++){
-                                if(bufferB[id]==0)flag = 1;
-                            }
-                        }
-                    }
+                for(int jj = start_off; jj < js + minJ && jj < nTo; jj+= minJJ) {
                     minJJ = minJ + js - jj;
                     if (minJJ > Jblock){
                         minJJ = Jblock;
                     }
-                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda, bufbb + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
-                }
-
-                for(int jj = js; jj < start_off && jj < js + minJ; jj += minJJ) {
-                    minJJ = minJ + js - jj;
-                    if(minJJ > Jblock) {
-                        minJJ = Jblock;
-                    }
-                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda, bufbb + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
+                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda, bufbb + nypos*minL*minJ + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
                 }
             }
         }
@@ -209,17 +187,11 @@ void cblas_gemm_s8s8s32( const CBLAS_LAYOUT layout,
     newArgs.oa = oa;
     newArgs.ob = ob;
     newArgs.oc = oc;
-    
     //计算任务划分
     BLASLONG rangeM[MAX_CPU_NUMBER + 2];
     BLASLONG rangeN[MAX_CPU_NUMBER + 2];
     GetMSimpleThreadsRegions(m, rangeM, nthreadsM, REGION_ALIGN_SIZE);
     GetMSimpleThreadsRegions(n, rangeN, nthreadsN, REGION_ALIGN_SIZE);
-
-
-    // 分配
-    // FLOAT* sa = BlasMemoryAlloc(LEVEL3_GEMM_Q*LEVEL3_GEMM_P*sizeof(FLOAT)*2*nthreadsN * 32);
-    // FLOAT* sb = BlasMemoryAlloc(LEVEL3_GEMM_Q*LEVEL3_GEMM_R*sizeof(FLOAT)*2*nthreadsN);
 
 
     BLASULONG mask = GEMM_PB_MASK | GEMM_PA_MASK;    // copy自common_level3.h
@@ -232,6 +204,6 @@ void cblas_gemm_s8s8s32( const CBLAS_LAYOUT layout,
     #pragma omp parallel for num_threads(nthreads) schedule(static) shared(sa, sb)
     for (int i = 0; i < nthreads; i++) {
         int thread_id = omp_get_thread_num();
-        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P*thread_id), sb, mask, rangeM, rangeN);
+        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P * thread_id), sb, mask, rangeM, rangeN);
     }
 }

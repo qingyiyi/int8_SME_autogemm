@@ -15,7 +15,7 @@
     "r": 8192,
     "jblock": 32,
     "region_align": 4,
-    "b_packing": "reference_two_phase"
+    "b_packing": "reference_full_panel_barrier"
   },
   "shapes": [
     [2048, 2048, 2048],

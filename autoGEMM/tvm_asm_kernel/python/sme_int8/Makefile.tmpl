@@ -53,7 +53,7 @@ $(TARGET): $(DRIVER_OBJ) $(LINK_ASM_OBJS)
 
 	$(CC) -shared $(OPENMP) -o $@ $^ -lm -lpthread -lnuma
 
-$(DRIVER_OBJ): $(DRIVER_SRC)
+$(DRIVER_OBJ): $(DRIVER_SRC) $(REF_ROOT)/int8_gemm.h
 
 	@mkdir -p $(dir $@)
 	$(CC) $(ALL_CFLAGS) -c $< -o $@

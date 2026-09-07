@@ -50,11 +50,11 @@ class CandidateGenerationTest(unittest.TestCase):
                 False,
             )
             self.assertEqual(manifest["candidate_id"], "sme-int8-k2048-p256-r8192-j32-t32x1")
-            self.assertEqual(manifest["buffer_contract"]["sa"]["candidate_bytes"], 33554432)
-            self.assertEqual(manifest["buffer_contract"]["sb"]["candidate_reference_allocation_bytes"], 67108864)
+            self.assertEqual(manifest["buffer_contract"]["sa"]["required_bytes"], 16777216)
+            self.assertEqual(manifest["buffer_contract"]["sb"]["required_bytes"], 16777216)
             self.assertEqual(
-                manifest["driver_synchronization"]["b_ready_state"],
-                "reference_single_nk_block",
+                manifest["driver_synchronization"]["protocol"],
+                "reference_full_panel_barrier",
             )
             self.assertTrue((bundle / "cblas_gemm_s8s8s32_autogemm.c").is_file())
             self.assertTrue((bundle / "Makefile").is_file())
@@ -87,24 +87,27 @@ class CandidateGenerationTest(unittest.TestCase):
                 self.assertTrue((bundle / "config.json").is_file())
                 self.assertTrue((bundle / "manifest.json").is_file())
 
-    def test_baseline_keeps_reference_single_block_synchronization(self) -> None:
+    def test_render_matches_reference_full_panel_barrier_protocol(self) -> None:
         source = driver.render(self.baseline)
         self.assertNotIn("bufferB[mypos] = NULL;", source)
-        self.assertEqual(source.count("#pragma omp barrier"), 1)
+        self.assertEqual(source.count("#pragma omp barrier"), 2)
         self.assertNotIn("#pragma omp flush", source)
+        self.assertNotIn("while (flag)", source)
+        self.assertIn("int myJ = (minJ + threads - 1) / threads;", source)
+        self.assertIn("const int start_off = (int)js;", source)
+        self.assertIn(
+            "sa + (LEVEL3_GEMM_Q * LEVEL3_GEMM_P * thread_id)",
+            source,
+        )
 
-    def test_render_resets_b_ready_state_for_multiple_n_blocks(self) -> None:
+    def test_reduced_r_uses_the_same_per_panel_barrier_protocol(self) -> None:
         config = deepcopy(self.baseline)
         config["driver"]["r"] = 2048
         source = driver.render(config)
-        reset = "bufferB[mypos] = NULL;"
-        publish = "bufferB[mypos] = bufbb;"
-        self.assertEqual(source.count(reset), 1)
-        self.assertEqual(source.count(publish), 1)
-        reset_index = source.index(reset)
-        self.assertGreaterEqual(source[:reset_index].count("#pragma omp barrier"), 1)
-        self.assertGreaterEqual(source[reset_index:].count("#pragma omp barrier"), 1)
-        self.assertIn("#pragma omp flush", source[source.index(publish):])
+        self.assertEqual(source.count("#pragma omp barrier"), 2)
+        self.assertNotIn("bufferB[mypos] = NULL;", source)
+        self.assertNotIn("#pragma omp flush", source)
+        self.assertNotIn("while (flag)", source)
 
 
 if __name__ == "__main__":

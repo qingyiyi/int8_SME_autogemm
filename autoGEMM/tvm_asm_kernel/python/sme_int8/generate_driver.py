@@ -23,20 +23,17 @@ MAKEFILE_TEMPLATE = MODULE_DIR / "Makefile.tmpl"
 
 EXPECTED_K = 2048
 MULTIPLE = 2048
-MAX_TARGET_N = 8192
 FIXED_DRIVER = {
     "threads_m": 32,
     "threads_n": 1,
     "q": 2048,
     "jblock": 32,
     "region_align": 4,
-    "b_packing": "reference_two_phase",
+    "b_packing": "reference_full_panel_barrier",
 }
 ALLOWED_P = (64, 128, 256)
 ALLOWED_R = (2048, 4096, 8192)
 PACK_ALIGNMENT = 16
-SA_DOUBLE_BUFFER_FACTOR = 2
-SB_REFERENCE_ALLOCATION_FACTOR = 4
 INT8_BYTES = 1
 
 
@@ -73,15 +70,6 @@ def validate_driver(driver: Dict[str, Any]) -> None:
         raise ValueError("driver.r must be one of %r; got %r" % (ALLOWED_R, r))
     if p % PACK_ALIGNMENT or r % PACK_ALIGNMENT:
         raise ValueError("driver.p and driver.r must be multiples of %d" % PACK_ALIGNMENT)
-
-    # The two-phase B pack first reserves Jblock columns for every M worker,
-    # then divides the remaining work among those workers.  Keep both phases
-    # non-empty in the initial search space.
-    if r < 2 * driver["jblock"] * driver["threads_m"]:
-        raise ValueError(
-            "driver.r must be at least 2 * jblock * threads_m for the reference B packing"
-        )
-
 
 def validate_config(config: Dict[str, Any]) -> None:
     if config.get("schema_version") != 1:
@@ -135,7 +123,9 @@ def buffer_contract(config: Dict[str, Any]) -> Dict[str, Any]:
 
     The CBLAS ABI supplies pointers but no capacities, so this is metadata for
     the caller and remote sweep runner rather than a runtime check.  The
-    formulas deliberately mirror the current reference driver and test.
+    formulas deliberately mirror the current reference driver and the caller's
+    shared-buffer contract. ``sa`` has one Q*P slice per OpenMP worker;
+    ``sb`` is one shared Q*R packed-B panel.
     """
     driver = config["driver"]
     q = driver["q"]
@@ -144,58 +134,22 @@ def buffer_contract(config: Dict[str, Any]) -> Dict[str, Any]:
     threads_m = driver["threads_m"]
     threads_n = driver["threads_n"]
     workers = threads_m * threads_n
-    sa_stride = q * p * INT8_BYTES * SA_DOUBLE_BUFFER_FACTOR * threads_n
+    sa_stride = q * p * INT8_BYTES
     return {
         "caller_allocates_buffers": True,
         "sa": {
             "per_worker_stride_bytes": sa_stride,
-            "candidate_bytes": sa_stride * workers,
+            "required_bytes": sa_stride * workers,
             "reference_capacity_bytes": (
-                q * max(ALLOWED_P) * INT8_BYTES * SA_DOUBLE_BUFFER_FACTOR *
-                threads_n * workers
+                q * max(ALLOWED_P) * INT8_BYTES * workers
             ),
         },
         "sb": {
-            "candidate_reference_allocation_bytes": (
-                q * r * INT8_BYTES * SB_REFERENCE_ALLOCATION_FACTOR
-            ),
+            "required_bytes": q * r * INT8_BYTES,
             "reference_capacity_bytes": (
-                q * max(ALLOWED_R) * INT8_BYTES * SB_REFERENCE_ALLOCATION_FACTOR
+                q * max(ALLOWED_R) * INT8_BYTES
             ),
         },
-    }
-
-
-def needs_b_ready_reset(config: Dict[str, Any]) -> bool:
-    """Whether a call can reuse sb across multiple N/K blocks."""
-    driver = config["driver"]
-    # The public ABI accepts the target family of shapes, not only the subset
-    # listed in a particular tuning run.  Any reduced R/Q therefore needs the
-    # reset protocol even when a config lists just one representative shape.
-    return driver["r"] < MAX_TARGET_N or driver["q"] < EXPECTED_K
-
-
-def b_ready_template_values(config: Dict[str, Any]) -> Dict[str, str]:
-    if not needs_b_ready_reset(config):
-        return {
-            "B_READY_PREPARE": "#pragma omp barrier",
-            "B_READY_PUBLISH_FLUSH": "",
-            "B_READY_POLL_FLUSH": "",
-        }
-    return {
-        "B_READY_PREPARE": (
-            "            /* The first barrier prevents a fast M worker from clearing a\n"
-            "             * prior block's ready flag while a slower worker still polls it.\n"
-            "             * The second makes every new-block flag visibly empty before any\n"
-            "             * worker starts asynchronous two-phase B packing. */\n"
-            "#pragma omp barrier\n"
-            "            if (mask & GEMM_PB_MASK) {\n"
-            "                bufferB[mypos] = NULL;\n"
-            "            }\n"
-            "#pragma omp barrier"
-        ),
-        "B_READY_PUBLISH_FLUSH": "#pragma omp flush",
-        "B_READY_POLL_FLUSH": "#pragma omp flush",
     }
 
 
@@ -213,7 +167,6 @@ def render(config: Dict[str, Any]) -> str:
         "JBLOCK": str(driver["jblock"]),
         "REGION_ALIGN": str(driver["region_align"]),
     }
-    values.update(b_ready_template_values(config))
     return Template(DRIVER_TEMPLATE.read_text(encoding="ascii")).substitute(values)
 
 
@@ -234,21 +187,14 @@ def build_manifest(config_path: Path, config: Dict[str, Any], reference_root: st
         "kernel_sources_are_unmodified": True,
         "target_shapes": config["shapes"],
         "driver": config["driver"],
-        "driver_synchronization": (
-            {
-                "b_ready_state": "reset_before_each_nk_block",
-                "block_entry_barriers": 2,
-                "publish_flush": True,
-                "poll_flush": True,
-            }
-            if needs_b_ready_reset(config)
-            else {
-                "b_ready_state": "reference_single_nk_block",
-                "block_entry_barriers": 1,
-                "publish_flush": False,
-                "poll_flush": False,
-            }
-        ),
+        "driver_synchronization": {
+            "protocol": "reference_full_panel_barrier",
+            "barriers_per_nk_block": 2,
+            "b_ready_snoop": False,
+            "ready_state_reset": False,
+            "openmp_flush": False,
+            "b_packing_compute_overlap": False,
+        },
         "buffer_contract": buffer_contract(config),
     }
 

@@ -8,6 +8,10 @@
 - 不改：现有 SME 汇编、A/B packer、导出函数签名、调用方分配的 `sa/sb`。
 - 固定合同：`K=2048`，`M/N` 为 2048 的倍数，`alpha=1`，`beta=0`，
   `threadsM=32`，`threadsN=1`。
+- 同步基线（2026-09-07）：以最新 `int8gemm-kblas/int8_gemm.c/.h` 为准。每个
+  `(N,K)` panel 用两道 barrier 完成「上一 panel 结束 → 并行完整 pack B → B 全部
+  就绪 → pack A + kernel」；旧版 ready-flag snoop、轮询、`omp flush` 和 B-pack /
+  compute overlap 已取消。
 - 搜索记录默认是测量结果，不等同于正确性已验收；最终候选才运行 `--verify`。
 
 ## P1：候选配置生成器
@@ -22,16 +26,16 @@ driver 和同一组汇编链接方式。
 | `P` | `64, 128, 256` | 调用方现有 `sa` 容量按 `P=256` 分配；只允许不超过 256。 |
 | `R` | `2048, 4096, 8192` | 调用方现有 `sb` 容量按 `R=8192` 分配；只允许不超过 8192。 |
 | `Q` | `2048` | 当前 K 和 kernel/packer 合同固定。 |
-| `Jblock` | `32` | 暂不开放，避免改变 32 线程 B packing 分工与等待逻辑。 |
+| `Jblock` | `32` | 暂不开放，避免改变 32 线程 B packing 分工和 kernel 列块大小。 |
 | 线程与分区 | `32 x 1`、`region_align=4` | 首轮保持参考实现。 |
 
 交付：候选 JSON schema、参数验证、每个候选的生成 manifest，manifest 明确记录
 所需 `sa/sb` 上界、编译命令、汇编 object 和 ABI。
 
-实现约束：`R<8192` 会使一个调用进入多个 N block。生成的 driver 必须先用
-barrier 保证全部线程已离开上一 N/K block，再清空每个线程的 B-ready 标记，并
-用第二道 barrier 保证全部标记已清空；发布/轮询处执行 OpenMP flush。不得复用
-上一 N block 的非空标记，也不得把异步 B packing 改为全局完成后才计算的同步路径。
+实现约束：`R<8192` 会使一个调用进入多个 N block。每一个 N/K block 都沿用参考
+代码的两道 barrier：第一道确保全部线程已离开上一 block 后才覆盖共享 `sb`，第二
+道确保该 block 的 B 已完整 pack 后才开始 A packing 和 SME kernel。不得重新引入
+B-ready snoop、轮询或 `omp flush`；当前参考协议本身不包含 B-pack / compute overlap。
 
 验收：本机 Python/render/Makefile 静态检查；远端对每个候选执行 `make all check`
 和 `nm -D` 导出检查。
@@ -88,7 +92,8 @@ P1-P3 稳定后，按一次只增加一个变量的顺序扩展：
 ## 当前进度
 
 - P1 代码已完成：`generate_candidates.py` 可生成 9 个 P/R bundle，且保留
-  baseline 单 bundle 入口；主机侧生成/约束测试已通过。
+  baseline 单 bundle 入口；2026-09-07 已将模板、缓冲区合同和 manifest 从旧 snoop
+  协议同步为最新参考 C driver 的完整 panel barrier 协议；本机静态复验已通过。
 - P2 代码已完成：`sweep_candidates.py` 支持 quick shape 初筛、top-k 全 shape
   测量、独立日志和汇总；主机侧伪目标烟测已通过。
 - P2 尚待远端验证：需要在 SME 机器上用真实汇编 object、编译器和
@@ -106,6 +111,7 @@ P1-P3 稳定后，按一次只增加一个变量的顺序扩展：
 
 ## 当前下一步
 
-将本目录同步到远端，先生成 9 个 bundle，再运行 README 中的 P2 命令。回传
-`sweep_summary.json`、一个 build log 和一个 full evaluation log 后，再进入 P3
-的 AutoGEMM/AutoTVM workload 接入；在此之前不修改 SME 汇编或扩大搜索变量。
+将最新 `int8_gemm.c/.h` 与 P2 最小 AutoGEMM 同步集同步到远端，先生成 9 个
+bundle，再运行 README 中的 P2 命令。回传 `sweep_summary.json`、一个 build log 和
+一个 full evaluation log 后，再进入 P3 的 AutoGEMM/AutoTVM workload 接入；在此
+之前不修改 SME 汇编或扩大搜索变量。

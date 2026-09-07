@@ -98,23 +98,18 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb,
             if (minL >= LEVEL3_GEMM_Q) {
                 minL = LEVEL3_GEMM_Q;
             }
-${B_READY_PREPARE}
+#pragma omp barrier
             if (mask & GEMM_PB_MASK) {
-                int minJJ = SME_JBLOCK;
-                int myJ = SME_JBLOCK * mypos;
-                PACK_B(minL, minJJ, b, ldb, ls, js + myJ,
-                    bufbb + minL * myJ, args->ob);
-                const int Jleft = (int)minJ - SME_JBLOCK * threads;
-                myJ = (Jleft + threads - 1) / threads;
-                if (myJ * mypos + myJ > Jleft) {
-                    myJ = Jleft - myJ * mypos;
+                int myJ = (minJ + threads - 1) / threads;
+                if (myJ * mypos > nTo) {
+                    myJ = nTo - myJ * mypos;
                 }
-                PACK_B(minL, myJ, b, ldb, ls,
-                    js + SME_JBLOCK * threads + myJ * mypos,
-                    bufbb + minL * (SME_JBLOCK * threads + myJ * mypos), args->ob);
+                PACK_B(minL, myJ, b, ldb, ls, js + myJ * mypos,
+                    bufbb + nypos * minL * minJ + minL * (myJ * mypos), args->ob);
                 bufferB[mypos] = bufbb;
-${B_READY_PUBLISH_FLUSH}
             }
+
+#pragma omp barrier
 
             for (is = mFrom; is < mTo; is += minI) {
                 minI = mTo - is;
@@ -125,35 +120,15 @@ ${B_READY_PUBLISH_FLUSH}
                 PACK_A(minL, minI, a, lda, ls, is, bufaa, args->oa);
 
                 int minJJ = SME_JBLOCK;
-                const int start_off = (int)js + minJJ * mypos;
-                for (int jj = start_off; jj < js + minJ; jj += minJJ) {
-                    if (jj > start_off && is == mFrom) {
-                        volatile int flag = 1;
-                        while (flag) {
-                            flag = 0;
-${B_READY_POLL_FLUSH}
-                            for (int id = 0; id < threads; ++id) {
-                                if (bufferB[id] == 0) {
-                                    flag = 1;
-                                }
-                            }
-                        }
-                    }
+                const int start_off = (int)js;
+                for (int jj = start_off; jj < js + minJ && jj < nTo; jj += minJJ) {
                     minJJ = minJ + js - jj;
                     if (minJJ > SME_JBLOCK) {
                         minJJ = SME_JBLOCK;
                     }
                     KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda,
-                        bufbb + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
-                }
-
-                for (int jj = (int)js; jj < start_off && jj < js + minJ; jj += minJJ) {
-                    minJJ = minJ + js - jj;
-                    if (minJJ > SME_JBLOCK) {
-                        minJJ = SME_JBLOCK;
-                    }
-                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda,
-                        bufbb + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
+                        bufbb + nypos * minL * minJ + (jj - js) * minL,
+                        ldb, c, ldc, is, jj, NULL);
                 }
             }
         }
@@ -207,8 +182,7 @@ void ${EXPORT}(const CBLAS_LAYOUT layout, const CBLAS_TRANSPOSE transa,
     for (int i = 0; i < nthreads; ++i) {
         const int thread_id = omp_get_thread_num();
         SmeGemmDriver(&newArgs,
-            sa + (LEVEL3_GEMM_Q * LEVEL3_GEMM_P * sizeof(FLOAT) * 2 *
-                nthreadsN * thread_id),
+            sa + (LEVEL3_GEMM_Q * LEVEL3_GEMM_P * thread_id),
             sb, mask, rangeM, rangeN);
     }
 }
