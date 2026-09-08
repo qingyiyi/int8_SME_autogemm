@@ -12,7 +12,8 @@
   `(N,K)` panel 用两道 barrier 完成「上一 panel 结束 → 并行完整 pack B → B 全部
   就绪 → pack A + kernel」；旧版 ready-flag snoop、轮询、`omp flush` 和 B-pack /
   compute overlap 已取消。
-- 搜索记录默认是测量结果，不等同于正确性已验收；最终候选才运行 `--verify`。
+- 最终搜索默认是正确性门控：任何 candidate 必须先通过全部九组 `--verify`，才会
+  测性能或进入全局排名；未验证记录只能由明确的调试选项产生，不能发布为最终库。
 
 ## P1：候选配置生成器
 
@@ -40,24 +41,29 @@ B-ready snoop、轮询或 `omp flush`；当前参考协议本身不包含 B-pack
 验收：本机 Python/render/Makefile 静态检查；远端对每个候选执行 `make all check`
 和 `nm -D` 导出检查。
 
-## P2：快速远端搜索器
+## P2：远端完整搜索器
 
-目标：在不重复执行九组正确性测试的前提下，构建、测量和记录 P1 的候选。
+目标：一次命令生成、构建、验证、测量和发布 P1 的候选，不让“性能好但未验证”的
+库进入最终结果。
 
 流程：
 
 1. 生成候选目录并链接已验证的四个参考汇编 object。
 2. 对每个候选做编译和 ABI 检查。
-3. 先对一个指定 shape 测量全部候选，用于快速筛选。
-4. 将每个 shape 的前 K 个候选再测完整九组 shape。
-5. 原始记录保留 `candidate_id`、P/R、shape、库哈希、完整命令和时间；
-   未执行验证的记录标记 `correctness=not_checked`，不得当作最终正确结果。
+3. 对每个候选的全部九个 shape 先运行正确性测试；任一 shape 失败，该 candidate
+   标记 `correctness_failed`，后续不测性能。
+4. 只对完整正确性通过的 candidate 测全部九个 shape 的完整
+   `cblas_gemm_s8s8s32` 调用时间。
+5. 使用九个 GFLOPS 的几何平均值作为默认全局排序；可选择总延迟作为替代目标。
+6. 只有完整测量的第一名会复制到
+   `best/libint8gemm_autogemm.so`；没有合格者则非零退出且不发布新库。
 
-默认排序按 shape 分开保存。若九个 shape 的最优 P/R 不同，后续再决定生成单一
-全局 profile，或在保持同一 ABI 的前提下增加按 `(M,N)` 分派的 profile 表。
+交付入口：`scripts/sme_int8/run_search.sh`。它在一个输出根目录中保留候选源、每个
+build/ABI/evaluation 日志、JSONL 原始记录、`summary.json`、`best_candidate.json` 和
+最终 `.so`。旧的 `generate_*`、`sweep_*`、`evaluate_*` 脚本仅保留作开发定位工具。
 
-验收：远端能从任一候选生成 `.so`、解析完整 `cblas_gemm_s8s8s32` 调用时间，
-并写出可复现实验记录；失败候选写拒绝记录但不参与排名。
+验收：远端一次 `run_search.sh` 可从九个 P/R 候选中产生可复现的 summary，且只有
+九组正确性均通过、九组性能均可解析的候选可成为 winner。
 
 ## P3：AutoGEMM/AutoTVM 适配
 
@@ -83,35 +89,52 @@ P1-P3 稳定后，按一次只增加一个变量的顺序扩展：
    `no-prefetch` 保留为基线。
 4. 只有准备修改汇编时，才进入 SME micro-kernel 形状、K loop 和流水调优。
 
-## P5：最终正确性与发布候选
+## P5：后续扩展后的最终正确性与发布候选
 
-- 对 baseline、每个 shape 的最优候选，以及最终合并 profile 执行九组 `--verify`。
-- 只把通过验证的记录标记为 `correctness=passed` 并作为最终性能结论。
-- 若某个候选失败，回退到该 shape 的下一个已测候选；不修改现有汇编来掩盖错误。
+- P2 已对首轮 P/R 全部候选实行正确性门控；P5 适用于未来扩大搜索变量后的重复验收。
+- 对每一轮的新候选仍执行完整九组 `--verify`，只有完全通过者才能测性能和发布。
+- 若某个候选失败，记录失败并让全局排序自动排除它；不修改现有汇编来掩盖错误。
 
 ## 当前进度
 
 - P1 代码已完成：`generate_candidates.py` 可生成 9 个 P/R bundle，且保留
   baseline 单 bundle 入口；2026-09-07 已将模板、缓冲区合同和 manifest 从旧 snoop
   协议同步为最新参考 C driver 的完整 panel barrier 协议；本机静态复验已通过。
-- P2 代码已完成：`sweep_candidates.py` 支持 quick shape 初筛、top-k 全 shape
-  测量、独立日志和汇总；主机侧伪目标烟测已通过。
-- P2 尚待远端验证：需要在 SME 机器上用真实汇编 object、编译器和
-  `int8/test_unigemm` 执行批量构建与测量。
+- P2 总控入口已完成：`run_search.py` / `run_search.sh` 生成九个 candidate、逐个
+  构建和 ABI 检查、逐个九 shape 正确性验证、仅对通过者做九 shape 测量，并按全局目标
+  选择和复制最佳 `.so`。旧 `sweep_candidates.py` 保留为快速调试工具，不再是最终入口。
+- 本机已完成静态复验：24 个 Python 单元测试通过，Python 与 shell 语法检查通过。
+  其中包含对真实 `int8/test_unigemm.cpp` 性能输出格式、`LD_PRELOAD` 注入顺序和
+  `verify` / `0` 命令行参数合同的 evaluator 回归测试。
+- P2 尚待远端真实验证：需要在 SME 机器上用真实汇编 object、编译器和
+  `int8/test_unigemm` 运行 `run_search.sh`，才能取得真实性能和最终 winner。
 
 ## 本次启动记录（2026-09-03 16:31 +08:00）
 
-- 本机已复核 P2：13 个 Python 单元测试通过，Python 与 shell 语法检查通过，
+- 本机已复核 P2：24 个 Python 单元测试通过，Python 与 shell 语法检查通过，
   `git diff --check` 通过；9 个候选 bundle 生成烟测通过。
 - 本机没有 SME ISA、BiSheng 工具链或远端参考 object，因此不宣称完成真实
   `make all check`、性能测量或正确性验收。
-- 当前唯一待办是远端 P2 门槛：生成 9 个 bundle，批量构建并运行 quick/top-k
-  搜索；结果需回传 `sweep_summary.json`、至少一个 build log 和一个完整评测
-  log。未带 `--verify` 的记录只能用于候选排序。
+- 当前唯一待办是远端 P2 门槛：执行一次完整正确性门控搜索；结果需回传
+  `summary.json`、`best_candidate.json`、至少一个 build log 和一个完整评测 log。
+  未带 `--verify` 的记录只能用于开发调试，不能选出最终 best 库。
+
+## 本次复验记录（2026-09-07）
+
+- 已确认 `int8/test_unigemm.cpp` 的实际性能行是
+  `average int8gemm time = <seconds>`；`evaluate_candidate.py` 的解析正则与其一致。
+- 已确认每次调用参数严格为
+  `test_unigemm M N K kblas verify`（正确性阶段）和
+  `test_unigemm M N K kblas 0`（性能阶段）；候选库通过 `LD_PRELOAD` 排在已有
+  preload 库之前注入。
+- 已运行完整本机复验：24/24 Python 单元测试通过，`py_compile`、`bash -n`、根仓库
+  与 `autoGEMM` 嵌套仓库的 `git diff --check` 均通过。
+- 本机仍不具备 BiSheng、SME ISA、远端四个 object 或 HBM/NUMA 测试环境；因此上述
+  结果不替代远端 `make all check`、九 shape 正确性或真实性能验收。
 
 ## 当前下一步
 
-将最新 `int8_gemm.c/.h` 与 P2 最小 AutoGEMM 同步集同步到远端，先生成 9 个
-bundle，再运行 README 中的 P2 命令。回传 `sweep_summary.json`、一个 build log 和
-一个 full evaluation log 后，再进入 P3 的 AutoGEMM/AutoTVM workload 接入；在此
-之前不修改 SME 汇编或扩大搜索变量。
+将最新 `int8_gemm.c/.h` 与包含 `run_search.py/run_search.sh` 的 SME AutoGEMM 目录
+同步到远端，直接运行 README 中的一条总控命令。回传 `summary.json`、
+`best_candidate.json`、一个 build log 和一个 evaluation log 后，再进入 P3 的
+AutoGEMM/AutoTVM workload 接入；在此之前不修改 SME 汇编或扩大搜索变量。
