@@ -204,12 +204,47 @@ void naive_notrans(
     int32_t *Cref, size_t ldc32i)
 {
     std::memset(Cref, 0, ldc32i * n * sizeof(int32_t));
-    for (size_t col = 0; col < n; ++col)
-        for (size_t row = 0; row < m; ++row)
-            for (size_t inner = 0; inner < k; ++inner)
-                Cref[col * ldc32i + row] +=
-                    static_cast<int32_t>(A8i[inner * lda8i + row]) *
-                    static_cast<int32_t>(B8i[col * ldb8i + inner]);
+
+    // Keep the C tile and the matching A/B panels in cache while preserving
+    // the original column-major, INT8 x INT8 -> INT32 accumulation order.
+    constexpr size_t row_block_size = 128;
+    constexpr size_t col_block_size = 16;
+    constexpr size_t inner_block_size = 128;
+
+#ifdef _OPENMP
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (size_t col_block = 0; col_block < n; col_block += col_block_size) {
+        for (size_t row_block = 0; row_block < m; row_block += row_block_size) {
+            const size_t col_end =
+                (col_block + col_block_size < n) ? col_block + col_block_size : n;
+            const size_t row_end =
+                (row_block + row_block_size < m) ? row_block + row_block_size : m;
+            const size_t row_count = row_end - row_block;
+
+            for (size_t inner_block = 0; inner_block < k; inner_block += inner_block_size) {
+                const size_t inner_end =
+                    (inner_block + inner_block_size < k) ? inner_block + inner_block_size : k;
+
+                for (size_t col = col_block; col < col_end; ++col) {
+                    int32_t *c_col = Cref + col * ldc32i + row_block;
+                    const int8_t *b_col = B8i + col * ldb8i + inner_block;
+
+                    for (size_t inner = inner_block; inner < inner_end; ++inner) {
+                        const int32_t b = static_cast<int32_t>(*b_col++);
+                        const int8_t *a_col = A8i + inner * lda8i + row_block;
+
+#if defined(__GNUC__)
+#pragma GCC ivdep
+#endif
+                        for (size_t row = 0; row < row_count; ++row) {
+                            c_col[row] += static_cast<int32_t>(a_col[row]) * b;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void fill_A_notrans(int8_t *A8i, size_t m, size_t k, size_t lda, unsigned seed) {
