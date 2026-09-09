@@ -17,6 +17,20 @@
     "region_align": 4,
     "b_packing": "reference_full_panel_barrier"
   },
+  "search_space": {
+    "p": [64, 128, 256],
+    "r": [2048, 4096, 8192],
+    "thread_groups": [
+      {
+        "threads_m": 32,
+        "threads_n": 1
+      },
+      {
+        "threads_m": 16,
+        "threads_n": 2
+      }
+    ]
+  },
   "shapes": [
     [2048, 2048, 2048],
     [2048, 4096, 2048],

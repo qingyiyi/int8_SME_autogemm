@@ -2,9 +2,10 @@
 """Generate and build INT8 SME candidate shared libraries only.
 
 This command deliberately never starts ``test_unigemm`` and never refers to
-the test project's source tree.  It emits one generated CBLAS driver per P/R
-candidate, links it with the caller-supplied, already validated SME objects,
-and publishes a flat ``libraries/*.so`` directory for a separate test step.
+the test project's source tree.  It emits one generated CBLAS driver per
+P/R/thread-group candidate declared in ``baseline_config.json``, links it with
+the caller-supplied, already validated SME objects, and publishes a flat
+``libraries/*.so`` directory for a separate test step.
 """
 
 from __future__ import annotations
@@ -21,13 +22,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from generate_candidates import candidate_config, parse_values
+from generate_candidates import candidate_config, fixed_driver_fields, selected_values
 from generate_driver import (
-    ALLOWED_P,
-    ALLOWED_R,
     DEFAULT_CONFIG,
     candidate_id,
+    configured_search_space,
     read_json,
+    search_space_json,
     sha256,
     validate_config,
     write_bundle,
@@ -182,39 +183,35 @@ def build_index(
     output: Path,
     force: bool,
 ) -> Dict[str, Any]:
+    """Render bundles for every configured P/R/thread-group candidate."""
+    configured = configured_search_space(base)
     candidates: List[Dict[str, Any]] = []
     for p in p_values:
         for r in r_values:
-            config = candidate_config(base, p, r)
-            identifier = candidate_id(config)
-            bundle = output / identifier
-            manifest = write_bundle(config, bundle, str(reference_root), force)
-            candidates.append({
-                "candidate_id": identifier,
-                "bundle_dir": identifier,
-                "config": config["driver"],
-                "manifest": "%s/manifest.json" % identifier,
-                "buffer_contract": manifest["buffer_contract"],
-            })
+            for threads_m, threads_n in configured["thread_groups"]:
+                config = candidate_config(base, p, r, threads_m, threads_n)
+                identifier = candidate_id(config)
+                bundle = output / identifier
+                manifest = write_bundle(config, bundle, str(reference_root), force)
+                candidates.append({
+                    "candidate_id": identifier,
+                    "bundle_dir": identifier,
+                    "config": config["driver"],
+                    "manifest": "%s/manifest.json" % identifier,
+                    "buffer_contract": manifest["buffer_contract"],
+                })
 
+    search_space = search_space_json(base)
+    search_space["p"] = list(p_values)
+    search_space["r"] = list(r_values)
     return {
         "schema_version": 1,
         "source_config": str(config_path),
         "source_config_sha256": sha256(config_path),
         "reference_root": str(reference_root),
         "candidate_count": len(candidates),
-        "fixed_driver": {
-            field: base["driver"][field]
-            for field in (
-                "threads_m",
-                "threads_n",
-                "q",
-                "jblock",
-                "region_align",
-                "b_packing",
-            )
-        },
-        "search_space": {"p": list(p_values), "r": list(r_values)},
+        "fixed_driver": fixed_driver_fields(base),
+        "search_space": search_space,
         "candidates": candidates,
     }
 
@@ -231,10 +228,10 @@ def parse_args() -> argparse.Namespace:
                         help="validated SME kernel/A-pack/B-pack object files")
     parser.add_argument("--sme-cc", default=None,
                         help="optional BiSheng-clang path passed to generated Makefiles")
-    parser.add_argument("--p-values", default=",".join(str(value) for value in ALLOWED_P),
-                        help="P candidates, comma-separated")
-    parser.add_argument("--r-values", default=",".join(str(value) for value in ALLOWED_R),
-                        help="R candidates, comma-separated")
+    parser.add_argument("--p-values", default=None,
+                        help="optional comma-separated subset of search_space.p")
+    parser.add_argument("--r-values", default=None,
+                        help="optional comma-separated subset of search_space.r")
     parser.add_argument("--build-timeout", type=float, default=3600.0,
                         help="maximum seconds for each candidate Make invocation")
     parser.add_argument("--force", action="store_true",
@@ -265,8 +262,9 @@ def main() -> int:
 
         base = read_json(config_path)
         validate_config(base)
-        p_values = parse_values(args.p_values, ALLOWED_P, "--p-values")
-        r_values = parse_values(args.r_values, ALLOWED_R, "--r-values")
+        configured = configured_search_space(base)
+        p_values = selected_values(args.p_values, configured["p"], "--p-values")
+        r_values = selected_values(args.r_values, configured["r"], "--r-values")
         index = build_index(
             config_path, base, reference_root, p_values, r_values, output, args.force
         )

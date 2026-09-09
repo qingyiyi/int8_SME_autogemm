@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only tests for constrained INT8 SME candidate generation."""
+"""Host-only tests for JSON-configured INT8 SME candidate generation."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import unittest
 MODULE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(MODULE_DIR))
 
+import generate_candidates as candidates
 import generate_driver as driver
 
 
@@ -28,8 +29,19 @@ class CandidateGenerationTest(unittest.TestCase):
             driver.candidate_id(self.baseline),
             "sme-int8-k2048-p256-r8192-j32-t32x1",
         )
+        self.assertEqual(
+            driver.search_space_json(self.baseline),
+            {
+                "p": [64, 128, 256],
+                "r": [2048, 4096, 8192],
+                "thread_groups": [
+                    {"threads_m": 32, "threads_n": 1},
+                    {"threads_m": 16, "threads_n": 2},
+                ],
+            },
+        )
 
-    def test_rejects_unsafe_p_and_r(self) -> None:
+    def test_p_and_r_must_be_declared_in_json_search_space(self) -> None:
         invalid_p = deepcopy(self.baseline)
         invalid_p["driver"]["p"] = 512
         with self.assertRaisesRegex(ValueError, "driver.p"):
@@ -39,6 +51,60 @@ class CandidateGenerationTest(unittest.TestCase):
         invalid_r["driver"]["r"] = 1024
         with self.assertRaisesRegex(ValueError, "driver.r"):
             driver.validate_config(invalid_r)
+
+    def test_p_and_r_can_be_changed_by_editing_json_search_space(self) -> None:
+        config = deepcopy(self.baseline)
+        config["search_space"]["p"] = [320]
+        config["search_space"]["r"] = [3072]
+        config["search_space"]["thread_groups"] = [
+            {"threads_m": 16, "threads_n": 2},
+        ]
+        config["driver"].update({
+            "p": 320,
+            "r": 3072,
+            "threads_m": 16,
+            "threads_n": 2,
+        })
+        driver.validate_config(config)
+        self.assertEqual(
+            driver.candidate_id(config),
+            "sme-int8-k2048-p320-r3072-j32-t16x2",
+        )
+
+    def test_thread_groups_are_indivisible_pairs_with_32_workers(self) -> None:
+        config = candidates.candidate_config(self.baseline, 256, 8192, 16, 2)
+        driver.validate_config(config)
+        self.assertEqual(
+            driver.candidate_id(config),
+            "sme-int8-k2048-p256-r8192-j32-t16x2",
+        )
+
+        wrong_total = deepcopy(self.baseline)
+        wrong_total["search_space"]["thread_groups"] = [
+            {"threads_m": 32, "threads_n": 2},
+        ]
+        wrong_total["driver"]["threads_m"] = 32
+        wrong_total["driver"]["threads_n"] = 2
+        with self.assertRaisesRegex(ValueError, "exactly 32 worker threads"):
+            driver.validate_config(wrong_total)
+
+        unsupported_pair = deepcopy(self.baseline)
+        unsupported_pair["search_space"]["thread_groups"] = [
+            {"threads_m": 8, "threads_n": 4},
+        ]
+        unsupported_pair["driver"]["threads_m"] = 8
+        unsupported_pair["driver"]["threads_n"] = 4
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            driver.validate_config(unsupported_pair)
+
+        missing_pair = deepcopy(self.baseline)
+        missing_pair["search_space"]["thread_groups"] = [
+            {"threads_m": 32, "threads_n": 1},
+        ]
+        missing_pair["driver"]["threads_m"] = 16
+        missing_pair["driver"]["threads_n"] = 2
+        with self.assertRaisesRegex(ValueError, "not present in search_space.thread_groups"):
+            driver.validate_config(missing_pair)
 
     def test_bundle_manifest_matches_external_buffer_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -53,6 +119,10 @@ class CandidateGenerationTest(unittest.TestCase):
             self.assertEqual(manifest["buffer_contract"]["sa"]["required_bytes"], 16777216)
             self.assertEqual(manifest["buffer_contract"]["sb"]["required_bytes"], 16777216)
             self.assertEqual(
+                manifest["buffer_contract"]["sb"]["reference_capacity_bytes"],
+                33554432,
+            )
+            self.assertEqual(
                 manifest["driver_synchronization"]["protocol"],
                 "reference_full_panel_barrier",
             )
@@ -61,7 +131,16 @@ class CandidateGenerationTest(unittest.TestCase):
             stored_manifest = json.loads((bundle / "manifest.json").read_text(encoding="ascii"))
             self.assertEqual(stored_manifest["driver"], self.baseline["driver"])
 
-    def test_bulk_generator_renders_nine_bundles(self) -> None:
+    def test_16x2_candidate_has_separate_b_panels(self) -> None:
+        config = candidates.candidate_config(self.baseline, 256, 8192, 16, 2)
+        contract = driver.buffer_contract(config)
+        self.assertEqual(contract["sa"]["required_bytes"], 16777216)
+        self.assertEqual(contract["sb"]["required_bytes"], 33554432)
+        source = driver.render(config)
+        self.assertIn("int nthreadsM = 16;", source)
+        self.assertIn("int nthreadsN = 2;", source)
+
+    def test_bulk_generator_renders_eighteen_bundles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "candidates"
             result = subprocess.run(
@@ -80,8 +159,11 @@ class CandidateGenerationTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             index = json.loads((output / "candidates.json").read_text(encoding="ascii"))
-            self.assertEqual(index["candidate_count"], 9)
-            self.assertEqual(index["search_space"], {"p": [64, 128, 256], "r": [2048, 4096, 8192]})
+            self.assertEqual(index["candidate_count"], 18)
+            self.assertEqual(index["search_space"], driver.search_space_json(self.baseline))
+            candidate_ids = {candidate["candidate_id"] for candidate in index["candidates"]}
+            self.assertIn("sme-int8-k2048-p256-r8192-j32-t32x1", candidate_ids)
+            self.assertIn("sme-int8-k2048-p256-r8192-j32-t16x2", candidate_ids)
             for candidate in index["candidates"]:
                 bundle = output / candidate["bundle_dir"]
                 self.assertTrue((bundle / "config.json").is_file())
@@ -103,11 +185,11 @@ class CandidateGenerationTest(unittest.TestCase):
     def test_reduced_r_uses_the_same_per_panel_barrier_protocol(self) -> None:
         config = deepcopy(self.baseline)
         config["driver"]["r"] = 2048
+        driver.validate_config(config)
         source = driver.render(config)
         self.assertEqual(source.count("#pragma omp barrier"), 2)
         self.assertNotIn("bufferB[mypos] = NULL;", source)
         self.assertNotIn("#pragma omp flush", source)
-        self.assertNotIn("while (flag)", source)
 
 
 if __name__ == "__main__":

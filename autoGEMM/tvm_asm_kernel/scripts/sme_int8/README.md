@@ -15,9 +15,52 @@
 cblas_gemm_s8s8s32
 ```
 
-当前候选范围仍是：`K=2048`、`M/N ∈ {2048,4096,8192}`、`alpha=1`、`beta=0`、
-`threadsM=32`、`threadsN=1`，搜索 `P={64,128,256}` 与 `R={2048,4096,8192}` 的
-9 个组合。A/B packing 和 SME 汇编 object 均复用已验证实现；生成部分只替换 C driver。
+当前默认候选范围是：`K=2048`、`M/N ∈ {2048,4096,8192}`、`alpha=1`、`beta=0`；
+搜索参数完全由
+[`python/sme_int8/baseline_config.json`](../../python/sme_int8/baseline_config.json)
+控制：`P={64,128,256}`、`R={2048,4096,8192}`，以及两个不可拆分的线程组
+`(threads_m, threads_n) ∈ {(32,1),(16,2)}`。每个线程组的乘积均为 32，因此默认会构建
+`3 × 3 × 2 = 18` 个候选，而不是将 `threads_m` 与 `threads_n` 做笛卡尔积。
+A/B packing 和 SME 汇编 object 均复用已验证实现；生成部分只替换 C driver。
+
+## 调参：只修改 `baseline_config.json`
+
+日常搜索不需要再改 Python 常量或在命令行填写 P/R。配置分为两层：
+
+```json
+"driver": {
+  "threads_m": 32,
+  "threads_n": 1,
+  "p": 256,
+  "q": 2048,
+  "r": 8192,
+  "jblock": 32,
+  "region_align": 4,
+  "b_packing": "reference_full_panel_barrier"
+},
+"search_space": {
+  "p": [64, 128, 256],
+  "r": [2048, 4096, 8192],
+  "thread_groups": [
+    {"threads_m": 32, "threads_n": 1},
+    {"threads_m": 16, "threads_n": 2}
+  ]
+}
+```
+
+- `shapes`：`test_candidate_sos.sh --all-shapes` 要测试的 `(M,N,K)` 列表。
+- `search_space.p`、`search_space.r`、`search_space.thread_groups`：批量构建时真正遍历的
+  候选参数；候选数为三者长度的乘积。
+- `threads_m` 和 `threads_n` 始终作为一个对象设置。当前只接受 `(32,1)` 或 `(16,2)`，且
+  `threads_m * threads_n` 必须为 `32`；不允许例如 `(8,4)` 或 `(32,2)`。
+- `driver`：直接调用 `generate_driver.py` 时的默认单个候选；其中的 P/R/线程组也必须出现在
+  `search_space` 中。`q`、`jblock`、`region_align` 也都由这里提供给生成的 C driver。
+- 当前后端仍限制 `q=K=2048`、P/R 为正的 16 字节对齐值，`jblock` 与 `region_align` 为正的
+  4 对齐值。修改搜索空间后，请重新做完整正确性验证；生成的 `manifest.json` 会记录每个候选
+  所需的 `sa`/`sb` 容量。
+
+正常构建命令不带 `--p-values` / `--r-values`，就会严格使用 JSON 中的完整搜索空间。这两个
+旧选项只保留为兼容用途，并且只能从 JSON 已声明的 P/R 中缩小范围，不能额外加入值。
 
 ## 先同步什么
 
@@ -66,7 +109,7 @@ bash scripts/sme_int8/build_candidate_sos.sh \
   --output /tmp/autogemm-sme-candidates
 ```
 
-这个命令只会对每个 `(P,R)` 执行等价于下面形式的构建：
+这个命令只会对每个 `(P,R,threads_m×threads_n)` 候选执行等价于下面形式的构建：
 
 ```bash
 make -C <candidate-dir> REF_ROOT=... KERNEL_OBJECTS="...四个 object..." all check
@@ -84,6 +127,7 @@ make -C <candidate-dir> REF_ROOT=... KERNEL_OBJECTS="...四个 object..." all ch
 
 ```text
 sme-int8-k2048-p256-r8192-j32-t32x1.so
+sme-int8-k2048-p256-r8192-j32-t16x2.so
 ```
 
 如果输出目录已存在，明确确认要刷新时加 `--force`。构建会继续尝试其余候选；只要有一个
@@ -156,7 +200,7 @@ bash scripts/sme_int8/test_candidate_sos.sh \
 /tmp/autogemm-sme-perf-8192/logs/<candidate>/<M>x<N>x<K>.log
 ```
 
-要测试全部 9 个输入规模，把 `--shape ...` 换成 `--all-shapes`：
+要测试 `baseline_config.json` 中配置的全部输入规模，把 `--shape ...` 换成 `--all-shapes`：
 
 ```bash
 bash scripts/sme_int8/test_candidate_sos.sh \

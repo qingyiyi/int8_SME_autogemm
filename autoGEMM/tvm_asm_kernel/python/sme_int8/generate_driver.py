@@ -4,6 +4,11 @@
 The generated driver owns the public CBLAS ABI.  The packers and SME kernel
 remain source files in the supplied reference root and are compiled unchanged
 by the emitted Makefile.
+
+All candidate-search knobs live in ``baseline_config.json``.  In particular,
+``search_space.p``, ``search_space.r``, and the paired
+``search_space.thread_groups`` determine the candidates emitted by the batch
+builders.
 """
 
 from __future__ import annotations
@@ -21,20 +26,17 @@ DEFAULT_CONFIG = MODULE_DIR / "baseline_config.json"
 DRIVER_TEMPLATE = MODULE_DIR / "driver.c.tmpl"
 MAKEFILE_TEMPLATE = MODULE_DIR / "Makefile.tmpl"
 
+# These are implementation constraints of the current SME driver, rather than
+# hidden tuning choices.  The tuneable tile and thread-group values are read
+# from baseline_config.json.
 EXPECTED_K = 2048
 MULTIPLE = 2048
-FIXED_DRIVER = {
-    "threads_m": 32,
-    "threads_n": 1,
-    "q": 2048,
-    "jblock": 32,
-    "region_align": 4,
-    "b_packing": "reference_full_panel_barrier",
-}
-ALLOWED_P = (64, 128, 256)
-ALLOWED_R = (2048, 4096, 8192)
 PACK_ALIGNMENT = 16
+KERNEL_TILE_ALIGNMENT = 4
 INT8_BYTES = 1
+THREAD_TOTAL = 32
+SUPPORTED_THREAD_GROUPS = ((32, 1), (16, 2))
+REFERENCE_B_PACKING = "reference_full_panel_barrier"
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -43,33 +45,154 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 
 def as_shape(value: Any) -> Tuple[int, int, int]:
-    if not isinstance(value, list) or len(value) != 3 or not all(isinstance(x, int) for x in value):
+    if (
+        not isinstance(value, list)
+        or len(value) != 3
+        or not all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+    ):
         raise ValueError("each shape must be an integer [M, N, K] list")
     return value[0], value[1], value[2]
 
 
 def as_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError("driver.%s must be an integer" % field)
+        raise ValueError("%s must be an integer" % field)
     return value
 
 
-def validate_driver(driver: Dict[str, Any]) -> None:
-    for field, expected in FIXED_DRIVER.items():
-        if driver.get(field) != expected:
-            raise ValueError(
-                "this SME backend fixes driver.%s=%r; got %r" %
-                (field, expected, driver.get(field))
-            )
+def as_positive_int(value: Any, field: str) -> int:
+    result = as_int(value, field)
+    if result <= 0:
+        raise ValueError("%s must be greater than zero" % field)
+    return result
 
-    p = as_int(driver.get("p"), "p")
-    r = as_int(driver.get("r"), "r")
-    if p not in ALLOWED_P:
-        raise ValueError("driver.p must be one of %r; got %r" % (ALLOWED_P, p))
-    if r not in ALLOWED_R:
-        raise ValueError("driver.r must be one of %r; got %r" % (ALLOWED_R, r))
-    if p % PACK_ALIGNMENT or r % PACK_ALIGNMENT:
-        raise ValueError("driver.p and driver.r must be multiples of %d" % PACK_ALIGNMENT)
+
+def tile_value(value: Any, field: str) -> int:
+    """Validate a P/R packing-panel size without imposing a hidden whitelist."""
+    result = as_positive_int(value, field)
+    if result % PACK_ALIGNMENT:
+        raise ValueError("%s must be a multiple of %d" % (field, PACK_ALIGNMENT))
+    return result
+
+
+def integer_list(value: Any, field: str) -> Tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("%s must be a non-empty integer list" % field)
+    result = tuple(tile_value(item, "%s[%d]" % (field, index)) for index, item in enumerate(value))
+    if len(set(result)) != len(result):
+        raise ValueError("%s must not contain duplicates" % field)
+    return result
+
+
+def thread_group(value: Any, field: str) -> Tuple[int, int]:
+    """Read one indivisible M/N worker-grid configuration.
+
+    ``threads_m`` and ``threads_n`` cannot be independently swept: changing
+    their Cartesian product would create unsupported worker grids.  The
+    current driver supports exactly 32x1 and 16x2, and both contain 32 OpenMP
+    workers in total.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("%s must be an object with threads_m and threads_n" % field)
+    threads_m = as_positive_int(value.get("threads_m"), "%s.threads_m" % field)
+    threads_n = as_positive_int(value.get("threads_n"), "%s.threads_n" % field)
+    if threads_m * threads_n != THREAD_TOTAL:
+        raise ValueError(
+            "%s must contain exactly %d worker threads; got %d x %d" %
+            (field, THREAD_TOTAL, threads_m, threads_n)
+        )
+    group = (threads_m, threads_n)
+    if group not in SUPPORTED_THREAD_GROUPS:
+        allowed = ", ".join("%d x %d" % pair for pair in SUPPORTED_THREAD_GROUPS)
+        raise ValueError("%s must be one of (%s); got %d x %d" % (
+            field, allowed, threads_m, threads_n
+        ))
+    return group
+
+
+def configured_search_space(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the validated, normalized candidate search-space from JSON."""
+    raw = config.get("search_space")
+    if not isinstance(raw, dict):
+        raise ValueError("search_space must be an object")
+
+    p_values = integer_list(raw.get("p"), "search_space.p")
+    r_values = integer_list(raw.get("r"), "search_space.r")
+    groups_raw = raw.get("thread_groups")
+    if not isinstance(groups_raw, list) or not groups_raw:
+        raise ValueError("search_space.thread_groups must be a non-empty list")
+    groups = tuple(
+        thread_group(value, "search_space.thread_groups[%d]" % index)
+        for index, value in enumerate(groups_raw)
+    )
+    if len(set(groups)) != len(groups):
+        raise ValueError("search_space.thread_groups must not contain duplicates")
+    return {
+        "p": p_values,
+        "r": r_values,
+        "thread_groups": groups,
+    }
+
+
+def search_space_json(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the normalized search space in JSON-serializable form."""
+    space = configured_search_space(config)
+    return {
+        "p": list(space["p"]),
+        "r": list(space["r"]),
+        "thread_groups": [
+            {"threads_m": threads_m, "threads_n": threads_n}
+            for threads_m, threads_n in space["thread_groups"]
+        ],
+    }
+
+
+def validate_driver(driver: Dict[str, Any], search_space: Dict[str, Any]) -> None:
+    if not isinstance(driver, dict):
+        raise ValueError("driver must be an object")
+
+    threads_m = as_positive_int(driver.get("threads_m"), "driver.threads_m")
+    threads_n = as_positive_int(driver.get("threads_n"), "driver.threads_n")
+    group = thread_group(
+        {"threads_m": threads_m, "threads_n": threads_n},
+        "driver thread group",
+    )
+    if group not in search_space["thread_groups"]:
+        raise ValueError(
+            "driver thread group %d x %d is not present in search_space.thread_groups" % group
+        )
+
+    p = tile_value(driver.get("p"), "driver.p")
+    r = tile_value(driver.get("r"), "driver.r")
+    if p not in search_space["p"]:
+        raise ValueError("driver.p must be present in search_space.p; got %d" % p)
+    if r not in search_space["r"]:
+        raise ValueError("driver.r must be present in search_space.r; got %d" % r)
+
+    q = tile_value(driver.get("q"), "driver.q")
+    if q != EXPECTED_K:
+        raise ValueError(
+            "this SME backend currently requires driver.q=%d; got %d" % (EXPECTED_K, q)
+        )
+
+    jblock = as_positive_int(driver.get("jblock"), "driver.jblock")
+    if jblock % KERNEL_TILE_ALIGNMENT:
+        raise ValueError(
+            "driver.jblock must be a multiple of %d" % KERNEL_TILE_ALIGNMENT
+        )
+
+    region_align = as_positive_int(driver.get("region_align"), "driver.region_align")
+    if region_align % KERNEL_TILE_ALIGNMENT:
+        raise ValueError(
+            "driver.region_align must be a multiple of %d" % KERNEL_TILE_ALIGNMENT
+        )
+
+    if driver.get("b_packing") != REFERENCE_B_PACKING:
+        raise ValueError(
+            "this driver template requires driver.b_packing=%r; got %r" %
+            (REFERENCE_B_PACKING, driver.get("b_packing"))
+        )
+
 
 def validate_config(config: Dict[str, Any]) -> None:
     if config.get("schema_version") != 1:
@@ -82,10 +205,9 @@ def validate_config(config: Dict[str, Any]) -> None:
         if not isinstance(abi.get(field), str) or not abi[field]:
             raise ValueError("abi.%s must be a non-empty symbol name" % field)
 
+    search_space = configured_search_space(config)
     driver = config.get("driver")
-    if not isinstance(driver, dict):
-        raise ValueError("driver must be an object")
-    validate_driver(driver)
+    validate_driver(driver, search_space)
 
     shapes = config.get("shapes")
     if not isinstance(shapes, list) or not shapes:
@@ -122,12 +244,15 @@ def buffer_contract(config: Dict[str, Any]) -> Dict[str, Any]:
     """Describe the external buffers required by the unchanged driver.
 
     The CBLAS ABI supplies pointers but no capacities, so this is metadata for
-    the caller and remote sweep runner rather than a runtime check.  The
-    formulas deliberately mirror the current reference driver and the caller's
-    shared-buffer contract. ``sa`` has one Q*P slice per OpenMP worker;
-    ``sb`` is one shared Q*R packed-B panel.
+    the caller and remote sweep runner rather than a runtime check.  ``sa``
+    has one Q*P slice per OpenMP worker.  ``sb`` has one Q*R panel per N-thread
+    group; this second factor is required for the 16x2 thread grid.
+
+    ``reference_capacity_bytes`` is the conservative buffer capacity needed to
+    test every candidate currently listed in ``search_space``.
     """
     driver = config["driver"]
+    search_space = configured_search_space(config)
     q = driver["q"]
     p = driver["p"]
     r = driver["r"]
@@ -141,13 +266,16 @@ def buffer_contract(config: Dict[str, Any]) -> Dict[str, Any]:
             "per_worker_stride_bytes": sa_stride,
             "required_bytes": sa_stride * workers,
             "reference_capacity_bytes": (
-                q * max(ALLOWED_P) * INT8_BYTES * workers
+                q * max(search_space["p"]) * THREAD_TOTAL * INT8_BYTES
             ),
         },
         "sb": {
-            "required_bytes": q * r * INT8_BYTES,
+            "required_bytes": q * r * threads_n * INT8_BYTES,
             "reference_capacity_bytes": (
-                q * max(ALLOWED_R) * INT8_BYTES
+                q
+                * max(search_space["r"])
+                * max(group[1] for group in search_space["thread_groups"])
+                * INT8_BYTES
             ),
         },
     }
@@ -188,7 +316,7 @@ def build_manifest(config_path: Path, config: Dict[str, Any], reference_root: st
         "target_shapes": config["shapes"],
         "driver": config["driver"],
         "driver_synchronization": {
-            "protocol": "reference_full_panel_barrier",
+            "protocol": config["driver"]["b_packing"],
             "barriers_per_nk_block": 2,
             "b_ready_snoop": False,
             "ready_state_reset": False,
