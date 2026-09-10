@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2022-2022. All rights reserved.
  * Description: gemm implementations
@@ -7,11 +6,6 @@
  * Notes: NA
  */
 #define ASSEMBLER
-// This translation unit consumes buffers produced by PACK_A/PACK_B.  Keep
-// LDC in x6 and do not select the alternate direct-input stack ABI.
-#ifndef PACKING
-#define PACKING 1
-#endif
 #include "common.h"
 
 #define EPILOGUE
@@ -46,7 +40,6 @@
 #define LDC         x6
 #endif
 #include "./gemm_sme_reg_defs.h"
-#include "./int8_gemm_common.S"
 #ifndef OFFSET_A
 #define OFFSET_A    MIN_M
 #endif
@@ -56,26 +49,20 @@
 
 #ifndef B_PRFM1_
 .macro B_PRFM1
-#ifndef SME_DISABLE_PREFETCH
 PRFM   PLDL2KEEP, [ptrbp]
-#endif
 add    ptrbp,ptrbp,#64
 .endm
 #endif
 
 #ifndef B_PRFM2_
 .macro B_PRFM2
-#ifndef SME_DISABLE_PREFETCH
 PRFM   PLDL2KEEP, [ptrbp]
-#endif
 add    ptrbp,ptrbp,#64
 .endm
 #endif
 
 .macro C_PRFM1
-#ifndef SME_DISABLE_PREFETCH
 PRFM   PLDL1STRM, [ptrcp, offset_pfc]
-#endif
 add	offset_pfc, offset_pfc, #64
 .endm
 
@@ -130,6 +117,7 @@ add	offset_pfc, offset_pfc, #64
 	add pB0, pB0, OFFSET_B, LSL #PRECI_WIDTH
 	add pA0, pA0, OFFSET_A, LSL #PRECI_WIDTH
 .endm
+
 .macro KERNEL_1VLX2VL a0,a1,b0,b1,ldopt=LD1,ldaopt=LD1
     LOAD_A0_INT8 \a0, p1
     LOAD_B0B1_INT8 \b0, \b1, p0, p3
@@ -139,8 +127,8 @@ add	offset_pfc, offset_pfc, #64
 	add pA0, pA0, OFFSET_A, LSL #PRECI_WIDTH
 .endm
 .macro KERNEL_2VLX2VL a0,a1,b0,b1,ldopt=LD1,ldaopt=LD1
-    LOAD_A0A1_INT8 \a0, \a1, p1, p2
-    LOAD_B0B1_INT8 \b0, \b1, p0, p3
+    LOAD_A0A1_INT8 \a0, \a1, p1, p2, \ldopt
+    LOAD_B0B1_INT8 \b0, \b1, p0, p3, \ldopt
     COMPUTE_MOPA_TYPED	za0.s, Pg_MOPA_1/m, Pg_MOPA_0/m, \a0\().PRECISION, \b0\().PRECISION
     COMPUTE_MOPA_TYPED	za1.s, Pg_MOPA_1/m, Pg_MOPA_3/m, \a0\().PRECISION, \b1\().PRECISION
     COMPUTE_MOPA_TYPED	za2.s, Pg_MOPA_2/m, Pg_MOPA_0/m, \a1\().PRECISION, \b0\().PRECISION
@@ -165,6 +153,21 @@ add	offset_pfc, offset_pfc, #64
     KERNEL_\mvl\()X\nvl z6,z7,z14,z15
 .endm
 
+// 新增M4/5/6/7宏定义
+.macro KERNEL_M4 mvl,nvl
+    KERNEL_\mvl\()X\nvl z16,z17,z24,z25
+.endm
+.macro KERNEL_M5 mvl,nvl
+    KERNEL_\mvl\()X\nvl z18,z19,z26,z27
+.endm
+.macro KERNEL_M6 mvl,nvl
+    KERNEL_\mvl\()X\nvl z20,z21,z28,z29
+.endm
+.macro KERNEL_M7 mvl,nvl
+    KERNEL_\mvl\()X\nvl z22,z23,z30,z31
+.endm
+// 新增M4/5/6/7宏定义
+
 .macro KERNEL_LDNT1D_M0 mvl,nvl
 	KERNEL_\mvl\()X\nvl z0,z1,z8,z9,LDNT1
 .endm
@@ -181,6 +184,21 @@ add	offset_pfc, offset_pfc, #64
     KERNEL_\mvl\()X\nvl z6,z7,z14,z15,LDNT1
 .endm
 
+// 新增M4/5/6/7宏定义
+.macro KERNEL_LDNT1D_M4 mvl,nvl
+    KERNEL_\mvl\()X\nvl z16,z17,z24,z25,LDNT1
+.endm
+.macro KERNEL_LDNT1D_M5 mvl,nvl
+    KERNEL_\mvl\()X\nvl z18,z19,z26,z27,LDNT1
+.endm
+.macro KERNEL_LDNT1D_M6 mvl,nvl
+    KERNEL_\mvl\()X\nvl z20,z21,z28,z29,LDNT1
+.endm
+.macro KERNEL_LDNT1D_M7 mvl,nvl
+    KERNEL_\mvl\()X\nvl z22,z23,z30,z31,LDNT1
+.endm
+// 新增M4/5/6/7宏定义
+
 .macro KERNEL_LDNT1DAB_M0 mvl,nvl
 	KERNEL_\mvl\()X\nvl z0,z1,z8,z9,LDNT1
 .endm
@@ -196,56 +214,68 @@ add	offset_pfc, offset_pfc, #64
 .macro KERNEL_LDNT1DAB_M3 mvl,nvl
     KERNEL_\mvl\()X\nvl z6,z7,z14,z15,LDNT1
 .endm
-
+// 有预取C
 .macro KERNEL_PRFMBC mvl,nvl
     KERNEL_M0 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
-	PRFM   PLDL1KEEP, [ptrbp]        # 预取b的指针在L1保持
-	PRFM   PLDL1KEEP, [ptrbp,#64]    # 一次取两个
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+	PRFM   PLDL1KEEP, [ptrbp]
+	PRFM   PLDL1KEEP, [ptrbp,#64]
 #endif
-	KERNEL_M1 \mvl \nvl         # 具体核心计算
+	KERNEL_M1 \mvl \nvl
 	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
 	KERNEL_M2 \mvl \nvl
 	KERNEL_M3 \mvl \nvl
-	KERNEL_M0 \mvl \nvl
-	KERNEL_M1 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
-	PRFM PLDL1KEEP, [ptrcp]  // P=128, Q=512
+	//! 测试，将后四次计算直接改成M4/M5/M6/M7
+	KERNEL_M4 \mvl \nvl
+	KERNEL_M5 \mvl \nvl
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+	// PRFM PLDL2KEEP, [ptrcp]  // P=128, Q=512
     add offset_pfc, offset_pfc, #128   // P=128, Q=512
-	PRFM PLDL1KEEP, [ptrcp, #64]
+	// PRFM PLDL2KEEP, [ptrcp, #64]
 	add ptrcp, ptrcp, LDC
-	PRFM PLDL1KEEP, [ptrcp]
-	PRFM PLDL1KEEP, [ptrcp, #64]
+	// PRFM PLDL2KEEP, [ptrcp]
+	// PRFM PLDL2KEEP, [ptrcp, #64]
 #endif
-	KERNEL_M2 \mvl \nvl
-	KERNEL_M3 \mvl \nvl
+	KERNEL_M6 \mvl \nvl
+	KERNEL_M7 \mvl \nvl
 .endm
 
+// 不预取C
 .macro KERNEL_3m_PRFMB mvl,nvl
     KERNEL_M0 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
-	PRFM   PLDL1KEEP, [ptrbp]
-	PRFM   PLDL1KEEP, [ptrbp,#64]
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+	#PRFM   PLDL2KEEP, [ptrbp]
+	#PRFM   PLDL2KEEP, [ptrbp,#64]
+	#add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
 #endif
 	KERNEL_M1 \mvl \nvl
-	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
+
 	KERNEL_M2 \mvl \nvl
 	KERNEL_M3 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
-	PRFM   PLDL1KEEP, [ptrbp]
-	PRFM   PLDL1KEEP, [ptrbp,#64]
-#endif
+	#PRFM   PLDL2KEEP, [ptrbp]
+	#PRFM   PLDL2KEEP, [ptrbp,#64]
+	#add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
+		
+//! 测试，将后四次计算直接改成M4/M5/M6/M7
 	KERNEL_M0 \mvl \nvl
 	KERNEL_M1 \mvl \nvl
-	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
+	
 	KERNEL_M2 \mvl \nvl
 	KERNEL_M3 \mvl \nvl
+
+	
+	PRFM   PLDL2KEEP, [ptrbp]
+	PRFM   PLDL2KEEP, [ptrbp,#64]
+	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
+		
 .endm
+
+
 
 .macro KERNEL_LDNTB_PRFMBC mvl,nvl
     KERNEL_LDNT1D_M0 \mvl \nvl
 	KERNEL_LDNT1D_M1 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
 	PRFM   PLDL1KEEP, [ptrbp]
 	PRFM   PLDL1KEEP, [ptrbp,#64]
 #endif
@@ -255,11 +285,12 @@ add	offset_pfc, offset_pfc, #64
 	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
 
 	KERNEL_LDNT1D_M3 \mvl \nvl
-	KERNEL_LDNT1D_M0 \mvl \nvl
-	KERNEL_LDNT1D_M1 \mvl \nvl
-	KERNEL_LDNT1D_M2 \mvl \nvl
+//! 测试，将后四次计算直接改成M4/M5/M6/M7
+	KERNEL_LDNT1D_M4 \mvl \nvl
+	KERNEL_LDNT1D_M5 \mvl \nvl
+	KERNEL_LDNT1D_M6 \mvl \nvl
 	
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
 	PRFM PLDL1KEEP, [ptrcp]  // P=128, Q=512
     add offset_pfc, offset_pfc, #128   // P=128, Q=512
 	PRFM PLDL1KEEP, [ptrcp, #64]
@@ -268,25 +299,31 @@ add	offset_pfc, offset_pfc, #64
 	PRFM PLDL1KEEP, [ptrcp, #64]
 #endif
 
-	KERNEL_LDNT1D_M3 \mvl \nvl
+	KERNEL_LDNT1D_M7 \mvl \nvl
 .endm
 
 .macro KERNEL_LDNTB_PRFMB mvl,nvl
     KERNEL_LDNT1D_M0 \mvl \nvl
 	KERNEL_LDNT1D_M1 \mvl \nvl
-#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM) && !defined(SME_DISABLE_PREFETCH)
-	PRFM   PLDL1KEEP, [ptrbp]
-	PRFM   PLDL1KEEP, [ptrbp,#64]
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+	PRFM   PLDL2KEEP, [ptrbp]
+	PRFM   PLDL2KEEP, [ptrbp,#64]
 #endif
 	KERNEL_LDNT1D_M2 \mvl \nvl
 
 	add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
 	
 	KERNEL_LDNT1D_M3 \mvl \nvl
+//! 测试，将后四次计算直接改成M4/M5/M6/M7
 	KERNEL_LDNT1D_M0 \mvl \nvl
 	KERNEL_LDNT1D_M1 \mvl \nvl
 	KERNEL_LDNT1D_M2 \mvl \nvl
 	KERNEL_LDNT1D_M3 \mvl \nvl
+#if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+	#PRFM   PLDL2KEEP, [ptrbp]
+	#PRFM   PLDL2KEEP, [ptrbp,#64]
+#endif
+	#add  ptrbp, ptrbp, OFFSET_B, LSL #PRECI_WIDTH
 .endm
 
 
@@ -313,6 +350,7 @@ add	offset_pfc, offset_pfc, #64
 	fmov beta, s1
 	dup	beta0, beta
 	
+	// 设置分块大小初始值
 	GET_ACTIVE_NUM_S p0, ELE_SIZE
 	GET_ACTIVE_NUM_H p0, MIN_N
 	GET_ACTIVE_NUM_H p0, MIN_M

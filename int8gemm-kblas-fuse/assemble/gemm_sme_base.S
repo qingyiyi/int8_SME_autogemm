@@ -59,7 +59,6 @@
 	bgt .loop_save_c_j_\mvl\()_\nvl\()_\label
 .endm
 
-
 #ifndef KERNEL_SAVE_C_BASE_1VL_IMPL_
 .macro KERNEL_SAVE_C_BASE_1VL_  mvl,nvl,c0=za0,c1=za1,c2 = za2,c3 = za3
 #ifdef DOUBLE
@@ -178,22 +177,22 @@
 .endm
 
 .macro KERNEL_MM_LOOP_KK label,mvl,nvl,kernel_prfmc,kernel_nprfmc,knl_lu,prfpc=ptrcp
-.\label\()_\mvl\()_\nvl\()_prfm_c: // evict b from cache at last m block   # 循环，每轮预取C
+.\label\()_\mvl\()_\nvl\()_prfm_c: // evict b from cache at last m block
     cmp wbk, #0
 	ble \knl_lu
-    \kernel_prfmc \mvl \nvl     # 调用传入的宏
+    \kernel_prfmc \mvl \nvl
 
 	sub	wbk, wbk, #1
-
+//看看C的预取是否已经完成
 	// sgemm
-	cmp offset_pfc,#128      
+	//cmp offset_pfc,#128
 
-	b.ne .\label\()_\mvl\()_\nvl\()_prfm_c   # 移动预取C指针
-    UPDATE_PRMC_CNT PRC_CNT, offset_pfc, \prfpc
-    cmp PRC_CNT, PRFC_NUM
-    b.lt .\label\()_\mvl\()_\nvl\()_prfm_c
-
-.\label\()_\mvl\()_\nvl\()_no_prfm_c:    # 不预取C
+	//b.ne .\label\()_\mvl\()_\nvl\()_prfm_c
+    //UPDATE_PRMC_CNT PRC_CNT, offset_pfc, \prfpc
+    //cmp PRC_CNT, PRFC_NUM
+    //b.lt .\label\()_\mvl\()_\nvl\()_prfm_c
+// 不在预取C
+.\label\()_\mvl\()_\nvl\()_no_prfm_c:
     cmp wbk, #0
 	ble \knl_lu
 	\kernel_nprfmc \mvl \nvl
@@ -272,27 +271,36 @@
 .endm
 
 .macro KERNEL_MM_LOOP_K label,mvl,nvl,k,is,m,min_m,cnt
+
 #if defined(SMALL_SME_GEMM)
     mov TMP_PTR, #0xffffffff
     dup z29.s, TMP_PTR_SIN
 #endif
+//如果K方向循环展开，这里需要改成#4
 	LSR wbk,\k,#3
 	sub \cnt, \m, \is
     cmp \cnt, \min_m
     b.le .\label\()_\mvl\()_\nvl\()_last_m_loopk//.k_loop_last_m_\()\label\()_\mvl\()_\nvl\()_prfm_c
-	KERNEL_MM_LOOP_KK k_loop_m_\()\label,\mvl,\nvl,KERNEL_PRFMBC,KERNEL_3m_PRFMB,KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label     # 正常处理
+	KERNEL_MM_LOOP_KK k_loop_m_\()\label,\mvl,\nvl,KERNEL_PRFMBC,KERNEL_3m_PRFMB,KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label
+
+//! testtest
+// b .end_of_loop_k_\nvl\()_\label
+
 .\label\()_\mvl\()_\nvl\()_last_m_loopk:
 	MUL TMP_CNT, MIN_N, LDC // \stepNum * ldc * sizeof(double/float)
 	LSR TMP_CNT, TMP_CNT, #PC_IMM
 	add ptrcp, pC,TMP_CNT
-	KERNEL_MM_LOOP_KK k_loop_last_m_\()\label,\mvl,\nvl,KERNEL_LDNTB_PRFMBC,KERNEL_LDNTB_PRFMB,KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label   #最后一次循环跳转
-
+	//M方向最后一次迭代
+	KERNEL_MM_LOOP_KK k_loop_last_m_\()\label,\mvl,\nvl,KERNEL_LDNTB_PRFMBC,KERNEL_LDNTB_PRFMB,KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label
+//KERNEL_MM_LOOP_KK里面会跳转到这里
 KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 #if !defined(SMALL_SME_GEMM)
+//如果K方向循环展开，这里和下面的#7都要改成#15
 	tst origK, #7
 	ble .SAVE_C_\mvl\()_\nvl\()_\label
 #endif
 	ANDS TMP_CNT,origK, #7
+	//K方向外层最后一次迭代
 	KERNEL_MM_LOOP_K_LU k_mm_m_lu_k_\label,KERNEL_M0,TMP_CNT, \mvl,\nvl
 .SAVE_C_\mvl\()_\nvl\()_\label:
 	KERNEL_SAVE_C_\mvl\()_\nvl \label
@@ -331,13 +339,14 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 	b .cond_of_loops_m_\nvl\()_\label
 .loops_of_m_\nvl\()_\label:
 	KERNEL_INIT
-    ZERO	{za0.B}    # za0清零
+    ZERO	{za0.B}
+	//设置MIN_M（stepNum） 
 	sub \stepNum, \stepNum,\stepNum
 	cntp \stepNum, p1, p1.h
 	KERNEL_MM_LOOP_M_PRE_FUNC
 
-	// sgemm
-	add ptrcp, pC0,#128     # ptrcp预取指针移动
+	// sgemm  设置C的预取指针
+	add ptrcp, pC0,#128
 
 	sub PRC_CNT,PRC_CNT,PRC_CNT
 	sub offset_pfc,offset_pfc,offset_pfc
@@ -348,7 +357,8 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 	sub TMP_CNT, TMP_CNT,TMP_CNT
 	UPDATE_PG_BY_CNTR p1, Pg_MOPA_1, TMP_CNT, \stepNum, ELE_SIZE
 	UPDATE_PG_BY_CNTR p2, Pg_MOPA_2, TMP_CNT, \stepNum, ELE_SIZE
-	KERNEL_MM_LOOP_K \label,2VL,\nvl,origK, counterI, \loopNum, \stepNum,TMP_CNT    # loopk  k方向循环
+	// k方向loop
+	KERNEL_MM_LOOP_K \label,2VL,\nvl,origK, counterI, \loopNum, \stepNum,TMP_CNT
 .loop_m_1vl_\nvl\()_\label:
 	sub TMP_CNT, TMP_CNT,TMP_CNT
 	UPDATE_PG_BY_CNTR p1, Pg_MOPA_1, TMP_CNT, \stepNum, ELE_SIZE
@@ -356,6 +366,7 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 
 	KERNEL_MM_LOOP_K \label,1VL,\nvl,origK, counterI, \loopNum, \stepNum,TMP_CNT
 .end_of_loop_k_\nvl\()_\label:
+//M方向counter+1
 	add  counterI , counterI,\stepNum
 
 	KERNEL_MM_LOOP_M_POST_FUNC
@@ -407,7 +418,10 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 	mov pB0, pBt
 
 	MUL TMP_CNT, origK , MIN_N
-	add ptrbp, pBt, TMP_CNT,lsl #PRECI_WIDTH
+	// add ptrbp, pBt, TMP_CNT,lsl #PRECI_WIDTH
+	// add ptrbp, pBt, origK,lsl #1
+	mov ptrbp, pBt
+
 .endm
 #endif
 #ifndef KERNEL_MM_LOOP_N_POST_FUNC_
@@ -429,15 +443,17 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 .loops_of_n:
 	mov pC0, pC
 	sub counterI, counterI, counterI
-	KERNEL_MM_LOOP_N_PRE_FUNC     # 保存原始指针
+	// 保存原始指针 stepNum1=32（即MIN_N） ELE_SIZE=16
+	KERNEL_MM_LOOP_N_PRE_FUNC
 	cmp \stepNum1,ELE_SIZE
 	ble .loops_of_l1_1vl
-.loops_of_l1_2vl:       # 处理分块
+.loops_of_l1_2vl:
 	sub TMP_CNT, TMP_CNT,TMP_CNT
 	UPDATE_PG_BY_CNTR p0, Pg_MOPA_0, TMP_CNT, \stepNum1, ELE_SIZE
 	UPDATE_PG_BY_CNTR p3, Pg_MOPA_3, TMP_CNT, \stepNum1, ELE_SIZE
 
-#if defined(INVALID_LAST_N)      /* Last N tile loads the next A block. */
+// 判断是否是n方向最后一次迭代
+#if defined(INVALID_LAST_N)
 	sub TMP_CNT, origN, counterJ
 	cmp TMP_CNT, MIN_N
 	b.le .loops_l1_2vl_last_n
@@ -447,6 +463,7 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 
 #if defined(INVALID_LAST_N)
 	b .loops_of_l1_1vl
+// n方向最后一次迭代
 .loops_l1_2vl_last_n:
 	KERNEL_MM_LOOP_L2_LDNTA k_loop_m_ldnta,2VL,\loopNum2, \stepNum2
 #endif
@@ -460,6 +477,7 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 
 	add counterJ,counterJ,\stepNum1
 	KERNEL_MM_LOOP_N_POST_FUNC
+	// 偏移C指针
 	MUL TMP_CNT, \stepNum1, LDC // \stepNum * ldc * sizeof(double/float)
 	LSR TMP_CNT, TMP_CNT, #PC_IMM
 	add pC, pC, TMP_CNT
@@ -476,7 +494,7 @@ KERNEL_MM_LU_\mvl\()_\nvl\()_K_\label:
 .endm
 #endif
 
-#ifndef KERNEL_MM_LOOP_N_         /* N outer loop entry. */
+#ifndef KERNEL_MM_LOOP_N_
 .macro KERNEL_MM_LOOP_N pre=s
 	KERNEL_MM_LOOP_L1 \pre,origN,origM,MIN_N,MIN_M
 .endm
