@@ -61,11 +61,19 @@ TEST_SRC   := test_int8gemm_kblas.cpp
 TEST_OBJ   := $(TEST_SRC:%.cpp=%.o)
 TEST_TARGET:= test_kblas_gemm
 
+# Portable reference checks never use target-only ARCH_FLAGS or target dependencies.
+HOST_CXX   ?= g++
+HOST_CXXFLAGS ?= -O2 -Wall -Wextra -Werror
+HOST_TEST  := tests/test_reference
+TEST_HEADERS := tests/reference.hpp tests/guarded_matrix.hpp
+REFERENCE_FP_FLAGS := -fno-fast-math -frounding-math -ffp-contract=off
+TEST_ARGS  ?= --suite smoke
+
 # ============================================
 # 编译规则
 # ============================================
 
-.PHONY: all clean check test
+.PHONY: all clean check test test-host verify
 
 all: $(TARGET)
 
@@ -82,6 +90,20 @@ test: $(TEST_TARGET)
 $(TEST_TARGET): $(TEST_OBJ) $(ALL_OBJS)
 	$(CXX) $(OPENMP) -o $@ $^ -lm -lpthread
 	@echo ">>> 生成测试程序: $@"
+
+# Run the target regression explicitly; `test` remains build-only.
+verify: $(TEST_TARGET)
+	./$(TEST_TARGET) $(TEST_ARGS)
+
+test-host: $(HOST_TEST)
+	./$(HOST_TEST)
+
+$(HOST_TEST): tests/test_reference.cpp $(TEST_HEADERS)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -std=c++17 $(REFERENCE_FP_FLAGS) $< -o $@ -lm
+
+# Keep the test oracle strict even if production flags change later.
+$(TEST_OBJ): $(TEST_SRC) $(TEST_HEADERS) int8_gemm.hpp
+	$(CXX) $(ALL_CFLAGS) -std=c++17 $(REFERENCE_FP_FLAGS) -c $< -o $@
 
 # C++ 文件编译
 # ---- 通用 C 规则不变 ----
@@ -115,7 +137,7 @@ assemble/%.o: assemble/%.S
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(CPP_OBJS) $(ASM_OBJS) $(TARGET) $(TEST_OBJ) $(TEST_TARGET)
+	rm -f $(CPP_OBJS) $(ASM_OBJS) $(TARGET) $(TEST_OBJ) $(TEST_TARGET) $(HOST_TEST)
 
 # 快速检查
 check: $(TARGET)

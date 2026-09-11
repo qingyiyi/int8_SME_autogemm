@@ -17,19 +17,18 @@ import generate_driver as driver
 
 
 class CandidateBuildContractTest(unittest.TestCase):
-    def test_make_command_only_builds_bundle_and_reference_objects(self) -> None:
+    def test_make_command_builds_bundled_assembly_sources(self) -> None:
         command = builder.make_build_command(
             Path("/tmp/out/sme-int8-k2048-p256-r8192-j32-t32x1"),
             Path("/data1/cxz/int8gemm-kblas"),
-            [Path("/obj/kernel.o"), Path("/obj/pack_a.o"), Path("/obj/pack_b.o")],
             "/toolchain/BiSheng-clang",
         )
 
         self.assertEqual(command[:3], ["make", "-C", "/tmp/out/sme-int8-k2048-p256-r8192-j32-t32x1"])
         self.assertIn("REF_ROOT=/data1/cxz/int8gemm-kblas", command)
-        self.assertIn("KERNEL_OBJECTS=/obj/kernel.o /obj/pack_a.o /obj/pack_b.o", command)
         self.assertIn("SME_CC=/toolchain/BiSheng-clang", command)
         self.assertEqual(command[-2:], ["all", "check"])
+        self.assertNotIn("KERNEL_OBJECTS", " ".join(command))
         self.assertNotIn("test_unigemm", " ".join(command))
 
     def test_build_index_uses_paired_thread_groups_from_json(self) -> None:

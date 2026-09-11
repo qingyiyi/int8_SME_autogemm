@@ -1,7 +1,7 @@
-# Generated SME INT8 CBLAS build.  It never changes the reference .S files.
+# Generated SME INT8 CBLAS build.  SME sources are bundled by autoGEMM.
 
 REF_ROOT ?= /path/to/int8gemm-kblas
-ASM_DIR ?= $(REF_ROOT)/arm64_sme
+ASM_DIR := assembly
 BISHENG_ROOT ?= /data1/env/HPCKit_26.0.RC1/HPCKit/latest/compiler/bisheng
 SME_CC ?= $(BISHENG_ROOT)/bin/BiSheng-clang
 CC := $(SME_CC)
@@ -25,58 +25,52 @@ DEFINES := -DUSE_SME_OPT -DINT8_SME -DUSE_SIMPLE_THREADED_LEVEL3 \
 OPENMP := -fopenmp=libomp
 INCLUDES := -I$(REF_ROOT) -I$(ASM_DIR) -I$(REF_ROOT)/include
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(DEFINES) $(OPENMP) $(INCLUDES)
+DEPFLAGS := -MMD -MP
 
-# This list intentionally mirrors the reference Makefile.  If the validated
-# remote source uses a different ASM directory, pass ASM_DIR=/that/directory.
 ASM_OBJS := \
   $(ASM_BUILD_DIR)/gemm_sme_nt.o \
   $(ASM_BUILD_DIR)/gemm_sme_nn.o \
   $(ASM_BUILD_DIR)/gemm_tcopy_zip.o \
   $(ASM_BUILD_DIR)/gemm_ncopy_unzip.o
-
-# Preferred baseline mode: pass the four validated reference objects through
-# KERNEL_OBJECTS.  This replaces only the generated C driver and leaves the
-# existing SME kernel/packer code bit-for-bit identical to the reference build.
-# When empty, the Makefile recompiles the source list above for later variants.
-KERNEL_OBJECTS ?=
-ifneq ($(strip $(KERNEL_OBJECTS)),)
-LINK_ASM_OBJS := $(KERNEL_OBJECTS)
-else
-LINK_ASM_OBJS := $(ASM_OBJS)
-endif
+SME_KERNEL_INCLUDES := \
+  $(ASM_DIR)/gemm_sme_packing.S \
+  $(ASM_DIR)/gemm_sme_base.S \
+  $(ASM_DIR)/int8_gemm_common.S \
+  $(ASM_DIR)/gemm_sme_reg_defs.h
+DEPS := $(DRIVER_OBJ:.o=.d) $(ASM_OBJS:.o=.d)
 
 .PHONY: all check print-config clean
 
 all: $(TARGET)
 
-$(TARGET): $(DRIVER_OBJ) $(LINK_ASM_OBJS)
+$(TARGET): $(DRIVER_OBJ) $(ASM_OBJS)
 
 	$(CC) -shared $(OPENMP) -o $@ $^ -lm -lpthread -lnuma
 
 $(DRIVER_OBJ): $(DRIVER_SRC) $(REF_ROOT)/int8_gemm.h
 
 	@mkdir -p $(dir $@)
-	$(CC) $(ALL_CFLAGS) -c $< -o $@
+	$(CC) $(ALL_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 $(ASM_BUILD_DIR)/gemm_tcopy_zip.o: $(ASM_DIR)/gemm_tcopy_zip.S
 
 	@mkdir -p $(dir $@)
-	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_itcopy -DASMFNAME=int8_sme_gemm_itcopy_ -DNAME=int8_sme_gemm_itcopy_ -DCNAME=int8_sme_gemm_itcopy -c $< -o $@
+	$(CC) $(ALL_CFLAGS) $(DEPFLAGS) -DASMNAME=int8_sme_gemm_itcopy -DASMFNAME=int8_sme_gemm_itcopy_ -DNAME=int8_sme_gemm_itcopy_ -DCNAME=int8_sme_gemm_itcopy -c $< -o $@
 
 $(ASM_BUILD_DIR)/gemm_ncopy_unzip.o: $(ASM_DIR)/gemm_ncopy_unzip.S
 
 	@mkdir -p $(dir $@)
-	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_oncopy -DASMFNAME=int8_sme_gemm_oncopy_ -DNAME=int8_sme_gemm_oncopy_ -DCNAME=int8_sme_gemm_oncopy -c $< -o $@
+	$(CC) $(ALL_CFLAGS) $(DEPFLAGS) -DASMNAME=int8_sme_gemm_oncopy -DASMFNAME=int8_sme_gemm_oncopy_ -DNAME=int8_sme_gemm_oncopy_ -DCNAME=int8_sme_gemm_oncopy -c $< -o $@
 
-$(ASM_BUILD_DIR)/gemm_sme_nn.o: $(ASM_DIR)/gemm_sme_nn.S
-
-	@mkdir -p $(dir $@)
-	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nn -DASMFNAME=int8_sme_gemm_kernel_nn_ -DNAME=int8_sme_gemm_kernel_nn_ -DCNAME=int8_sme_gemm_kernel_nn -c $< -o $@
-
-$(ASM_BUILD_DIR)/gemm_sme_nt.o: $(ASM_DIR)/gemm_sme_nt.S
+$(ASM_BUILD_DIR)/gemm_sme_nn.o: $(ASM_DIR)/gemm_sme_nn.S $(ASM_DIR)/gemm_sme_nt.S $(SME_KERNEL_INCLUDES)
 
 	@mkdir -p $(dir $@)
-	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nt -DASMFNAME=int8_sme_gemm_kernel_nt_ -DNAME=int8_sme_gemm_kernel_nt_ -DCNAME=int8_sme_gemm_kernel_nt -c $< -o $@
+	$(CC) $(ALL_CFLAGS) $(DEPFLAGS) -DASMNAME=int8_sme_gemm_kernel_nn -DASMFNAME=int8_sme_gemm_kernel_nn_ -DNAME=int8_sme_gemm_kernel_nn_ -DCNAME=int8_sme_gemm_kernel_nn -c $< -o $@
+
+$(ASM_BUILD_DIR)/gemm_sme_nt.o: $(ASM_DIR)/gemm_sme_nt.S $(SME_KERNEL_INCLUDES)
+
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) $(DEPFLAGS) -DASMNAME=int8_sme_gemm_kernel_nt -DASMFNAME=int8_sme_gemm_kernel_nt_ -DNAME=int8_sme_gemm_kernel_nt_ -DCNAME=int8_sme_gemm_kernel_nt -c $< -o $@
 
 check: $(TARGET)
 
@@ -88,8 +82,9 @@ print-config:
 	@echo "ASM_DIR=$(ASM_DIR)"
 	@echo "CC=$(CC)"
 	@echo "TARGET=$(TARGET)"
-	@echo "KERNEL_OBJECTS=$(KERNEL_OBJECTS)"
 
 clean:
 
 	rm -rf $(BUILD_DIR) $(TARGET)
+
+-include $(DEPS)

@@ -128,8 +128,38 @@ class CandidateGenerationTest(unittest.TestCase):
             )
             self.assertTrue((bundle / "cblas_gemm_s8s8s32_autogemm.c").is_file())
             self.assertTrue((bundle / "Makefile").is_file())
+            bundled_assembly = bundle / "assembly"
+            self.assertEqual(
+                sorted(path.name for path in bundled_assembly.iterdir()),
+                sorted(driver.EMBEDDED_ASSEMBLY_FILES),
+            )
+            for name in driver.EMBEDDED_ASSEMBLY_FILES:
+                self.assertEqual(
+                    driver.sha256(bundled_assembly / name),
+                    driver.sha256(driver.EMBEDDED_ASSEMBLY_DIR / name),
+                )
+            self.assertEqual(
+                sorted(manifest["assembly_sources"]),
+                sorted(driver.EMBEDDED_ASSEMBLY_FILES),
+            )
+            self.assertEqual(
+                manifest["assembly_source_sha256"],
+                {
+                    name: driver.sha256(driver.EMBEDDED_ASSEMBLY_DIR / name)
+                    for name in driver.EMBEDDED_ASSEMBLY_FILES
+                },
+            )
             stored_manifest = json.loads((bundle / "manifest.json").read_text(encoding="ascii"))
             self.assertEqual(stored_manifest["driver"], self.baseline["driver"])
+
+    def test_generated_makefile_compiles_bundled_assembly_and_tracks_includes(self) -> None:
+        makefile = driver.MAKEFILE_TEMPLATE.read_text(encoding="ascii")
+        self.assertIn("ASM_DIR := assembly", makefile)
+        self.assertNotIn("KERNEL_OBJECTS", makefile)
+        self.assertIn("$(ASM_DIR)/gemm_sme_packing.S", makefile)
+        self.assertIn("$(ASM_DIR)/gemm_sme_base.S", makefile)
+        self.assertIn("$(ASM_DIR)/int8_gemm_common.S", makefile)
+        self.assertIn("$(ASM_DIR)/gemm_sme_reg_defs.h", makefile)
 
     def test_16x2_candidate_has_separate_b_panels(self) -> None:
         config = candidates.candidate_config(self.baseline, 256, 8192, 16, 2)
@@ -168,6 +198,7 @@ class CandidateGenerationTest(unittest.TestCase):
                 bundle = output / candidate["bundle_dir"]
                 self.assertTrue((bundle / "config.json").is_file())
                 self.assertTrue((bundle / "manifest.json").is_file())
+                self.assertTrue((bundle / "assembly" / "gemm_sme_base.S").is_file())
 
     def test_render_matches_reference_full_panel_barrier_protocol(self) -> None:
         source = driver.render(self.baseline)

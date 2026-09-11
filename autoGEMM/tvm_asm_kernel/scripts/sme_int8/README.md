@@ -21,7 +21,8 @@ cblas_gemm_s8s8s32
 控制：`P={64,128,256}`、`R={2048,4096,8192}`，以及两个不可拆分的线程组
 `(threads_m, threads_n) ∈ {(32,1),(16,2)}`。每个线程组的乘积均为 32，因此默认会构建
 `3 × 3 × 2 = 18` 个候选，而不是将 `threads_m` 与 `threads_n` 做笛卡尔积。
-A/B packing 和 SME 汇编 object 均复用已验证实现；生成部分只替换 C driver。
+A/B packing 与 SME kernel 的完整汇编源码已内置在 AutoGEMM 中。每个候选包会复制这些源码，
+再与该候选的 C driver 一起编译、链接，不再要求目标机预先提供四个 `.o` 文件。
 
 ## 调参：只修改 `baseline_config.json`
 
@@ -83,15 +84,19 @@ python/sme_int8/generate_driver.py
 python/sme_int8/baseline_config.json
 python/sme_int8/driver.c.tmpl
 python/sme_int8/Makefile.tmpl
+python/sme_int8/assembly/
 ```
 
 目标机还必须已有且已验证：
 
-- `/data1/cxz/int8gemm-kblas/int8_gemm.h`；
-- 四个现有 object：SME NN/NT kernel、A packer、B packer；
+- `/data1/cxz/int8gemm-kblas/int8_gemm.h`、`common.h` 和 `include/`；
 - 已编好的 `/data1/cxz/int8/test_unigemm`；
 - `/data1/cxz/int8/lib/libint8gemm.so`（这是测试前会备份、结束后会恢复的原始库）；
 - BiSheng-clang、OpenMP、`numactl` 与测试程序所需运行环境。
+
+其中 `--reference-root` 仍用于读取 C driver 所需的头文件；SME 汇编则来自同步过去的
+`python/sme_int8/assembly/`。构建过程会在每个候选自己的 `build/asm/` 下生成临时 `.o`，
+再链接为 `.so`，但这些 `.o` 是正常中间产物，不是外部输入。
 
 ## 步骤 1：只生成所有候选 `.so`
 
@@ -100,11 +105,6 @@ python/sme_int8/Makefile.tmpl
 ```bash
 bash scripts/sme_int8/build_candidate_sos.sh \
   --reference-root /data1/cxz/int8gemm-kblas \
-  --kernel-objects \
-    /data1/cxz/int8gemm-kblas/assemble/gemm_sme_nt.o \
-    /data1/cxz/int8gemm-kblas/assemble/gemm_sme_nn.o \
-    /data1/cxz/int8gemm-kblas/assemble/gemm_tcopy_zip.o \
-    /data1/cxz/int8gemm-kblas/assemble/gemm_ncopy_unzip.o \
   --sme-cc /data1/env/HPCKit_26.0.RC1/HPCKit/latest/compiler/bisheng/bin/BiSheng-clang \
   --output /tmp/autogemm-sme-candidates
 ```
@@ -112,7 +112,7 @@ bash scripts/sme_int8/build_candidate_sos.sh \
 这个命令只会对每个 `(P,R,threads_m×threads_n)` 候选执行等价于下面形式的构建：
 
 ```bash
-make -C <candidate-dir> REF_ROOT=... KERNEL_OBJECTS="...四个 object..." all check
+make -C <candidate-dir> REF_ROOT=... SME_CC=... all check
 ```
 
 它不会读取、编译、链接或运行 `/data1/cxz/int8/test_unigemm`。成功后最方便的产物是：

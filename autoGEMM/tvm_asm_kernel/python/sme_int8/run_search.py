@@ -2,8 +2,9 @@
 """Generate, verify, benchmark, and publish the best INT8 SME candidate.
 
 This is the normal remote entry point for the constrained SME backend.  It
-keeps the existing SME kernel and packer objects unchanged, generates all P/R
-candidate drivers, and uses the existing test program through ``LD_PRELOAD``.
+generates all P/R candidate drivers, compiles the SME kernel and packer sources
+bundled with autoGEMM, and uses the existing test program through
+``LD_PRELOAD``.
 
 The default is deliberately correctness-gated:
 
@@ -350,8 +351,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference-root", type=Path, required=True,
                         help="int8gemm-kblas reference/source directory")
-    parser.add_argument("--kernel-objects", type=Path, nargs="+", required=True,
-                        help="four validated SME kernel/packer .o files")
     parser.add_argument("--test-bin", type=Path, required=True,
                         help="compiled int8/test_unigemm executable")
     parser.add_argument("--output", type=Path, required=True,
@@ -386,12 +385,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_inputs(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, List[Path], List[Tuple[int, int, int]]]:
+def validate_inputs(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, List[Tuple[int, int, int]]]:
     reference_root = args.reference_root.resolve()
     test_bin = args.test_bin.resolve()
     output_root = args.output.resolve()
     config_path = args.config.resolve()
-    kernel_objects = [path.resolve() for path in args.kernel_objects]
 
     if args.build_timeout <= 0 or args.timeout <= 0:
         raise ValueError("--build-timeout and --timeout must be greater than zero")
@@ -399,9 +397,6 @@ def validate_inputs(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, L
         raise ValueError("reference root is not a directory: %s" % reference_root)
     if not test_bin.is_file() or not os.access(test_bin, os.X_OK):
         raise ValueError("test binary is missing or not executable: %s" % test_bin)
-    missing_objects = [str(path) for path in kernel_objects if not path.is_file()]
-    if missing_objects:
-        raise ValueError("kernel object does not exist: %s" % ", ".join(missing_objects))
     if output_root.exists() and not output_root.is_dir():
         raise ValueError("output exists and is not a directory: %s" % output_root)
     if output_root.exists() and any(output_root.iterdir()) and not args.force:
@@ -414,7 +409,7 @@ def validate_inputs(args: argparse.Namespace) -> Tuple[Path, Path, Path, Path, L
     shapes = [as_shape(value) for value in config["shapes"]]
     if len(set(shapes)) != len(shapes):
         raise ValueError("config shapes must not contain duplicates")
-    return reference_root, test_bin, output_root, config_path, kernel_objects, shapes
+    return reference_root, test_bin, output_root, config_path, shapes
 
 
 def classify_evaluation_failure(rejections: Sequence[Dict[str, Any]], verify: bool) -> str:
@@ -429,7 +424,6 @@ def run_search(args: argparse.Namespace) -> int:
         test_bin,
         output_root,
         config_path,
-        kernel_objects,
         target_shapes,
     ) = validate_inputs(args)
 
@@ -447,7 +441,7 @@ def run_search(args: argparse.Namespace) -> int:
 
     inputs = {
         "reference_root": str(reference_root),
-        "kernel_objects": [str(path) for path in kernel_objects],
+        "kernel_source_mode": "autogemm_embedded_assembly",
         "test_bin": str(test_bin),
         "output_root": str(output_root),
         "candidates_root": str(candidates_root),
@@ -582,7 +576,6 @@ def run_search(args: argparse.Namespace) -> int:
                 continue
         else:
             build_env = os.environ.copy()
-            build_env["KERNEL_OBJECTS"] = " ".join(str(path) for path in kernel_objects)
             if args.sme_cc:
                 build_env["SME_CC"] = args.sme_cc
             build_command = [

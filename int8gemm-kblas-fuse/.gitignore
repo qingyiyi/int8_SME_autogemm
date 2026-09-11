@@ -1,0 +1,4 @@
+*.o
+*.so
+/test_kblas_gemm
+/tests/test_reference

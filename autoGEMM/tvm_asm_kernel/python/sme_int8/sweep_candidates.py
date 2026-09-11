@@ -2,9 +2,9 @@
 """Build and measure generated INT8 SME candidates on the target machine.
 
 This is intentionally a thin remote orchestration layer.  It does not modify
-the reference project or the SME assembly objects; each candidate gets its own
-build and result log so a failed build or measurement cannot contaminate the
-other candidates.
+the reference project; each candidate compiles its autoGEMM-bundled SME
+sources in an isolated build directory so failures cannot contaminate other
+candidates.
 """
 
 from __future__ import annotations
@@ -152,8 +152,6 @@ def parse_args() -> argparse.Namespace:
                         help="directory produced by generate_candidates.py")
     parser.add_argument("--reference-root", type=Path, required=True,
                         help="int8gemm-kblas source/reference root")
-    parser.add_argument("--kernel-objects", type=Path, nargs="+", required=True,
-                        help="validated SME/packer .o files to link into every candidate")
     parser.add_argument("--test-bin", type=Path, required=True,
                         help="remote int8/test_unigemm executable")
     parser.add_argument("--results-dir", type=Path, required=True,
@@ -177,7 +175,6 @@ def main() -> int:
     reference_root = args.reference_root.resolve()
     test_bin = args.test_bin.resolve()
     results_dir = args.results_dir.resolve()
-    kernel_objects = [path.resolve() for path in args.kernel_objects]
     quick_shape = parse_shape(args.quick_shape)
 
     if args.top_k <= 0:
@@ -191,10 +188,6 @@ def main() -> int:
         raise SystemExit("reference root is not a directory: %s" % reference_root)
     if not test_bin.is_file() or not os.access(test_bin, os.X_OK):
         raise SystemExit("test binary is missing or not executable: %s" % test_bin)
-    missing_objects = [str(path) for path in kernel_objects if not path.is_file()]
-    if missing_objects:
-        raise SystemExit("kernel object does not exist: %s" % ", ".join(missing_objects))
-
     try:
         index = read_json(index_path)
         candidates = candidate_entries(index)
@@ -210,7 +203,7 @@ def main() -> int:
     run_inputs = {
         "candidates_root": str(root),
         "reference_root": str(reference_root),
-        "kernel_objects": [str(path) for path in kernel_objects],
+        "kernel_source_mode": "autogemm_embedded_assembly",
         "test_bin": str(test_bin),
         "quick_shape": list(quick_shape),
         "top_k": args.top_k,
@@ -230,7 +223,7 @@ def main() -> int:
             "bundle_dir": str(bundle),
             "config": str(config_path),
             "library": str(library),
-            "kernel_objects": run_inputs["kernel_objects"],
+            "kernel_source_mode": run_inputs["kernel_source_mode"],
         }
 
         if not config_path.is_file():
@@ -240,7 +233,6 @@ def main() -> int:
 
         if not args.skip_build:
             build_env = os.environ.copy()
-            build_env["KERNEL_OBJECTS"] = " ".join(str(path) for path in kernel_objects)
             build_command = [
                 "make", "-C", str(bundle), "REF_ROOT=%s" % reference_root,
                 "all", "check",

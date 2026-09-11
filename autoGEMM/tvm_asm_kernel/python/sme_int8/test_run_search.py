@@ -134,8 +134,6 @@ class FullSearchHelpersTest(unittest.TestCase):
             test_bin = root / "test_unigemm"
             test_bin.write_text("#!/bin/sh\n", encoding="ascii")
             test_bin.chmod(0o755)
-            kernel = root / "kernel.o"
-            kernel.write_bytes(b"object")
             output = root / "output"
             candidates_root = output / "candidates"
             candidates_root.mkdir(parents=True)
@@ -179,7 +177,6 @@ class FullSearchHelpersTest(unittest.TestCase):
 
             args = Namespace(
                 reference_root=reference_root,
-                kernel_objects=[kernel],
                 test_bin=test_bin,
                 output=output,
                 config=driver.DEFAULT_CONFIG,
@@ -219,8 +216,6 @@ class FullSearchHelpersTest(unittest.TestCase):
             test_bin = root / "test_unigemm"
             test_bin.write_text("#!/bin/sh\n", encoding="ascii")
             test_bin.chmod(0o755)
-            kernel = root / "kernel.o"
-            kernel.write_bytes(b"object")
             output = root / "output"
             bundle = output / "candidates" / "bad"
             bundle.parent.mkdir(parents=True)
@@ -243,7 +238,6 @@ class FullSearchHelpersTest(unittest.TestCase):
 
             args = Namespace(
                 reference_root=reference_root,
-                kernel_objects=[kernel],
                 test_bin=test_bin,
                 output=output,
                 config=driver.DEFAULT_CONFIG,

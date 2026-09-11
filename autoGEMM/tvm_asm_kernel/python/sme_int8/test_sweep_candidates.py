@@ -57,8 +57,6 @@ class SweepHelpersTest(unittest.TestCase):
             (candidates / "candidates.json").write_text('{"candidates": [{"candidate_id": "x"}]}', encoding="ascii")
             reference = root / "reference"
             reference.mkdir()
-            kernel = root / "kernel.o"
-            kernel.write_bytes(b"")
             test_bin = root / "test"
             test_bin.write_text("#!/bin/sh\\n", encoding="ascii")
             test_bin.chmod(0o755)
@@ -67,7 +65,6 @@ class SweepHelpersTest(unittest.TestCase):
                 "sweep_candidates.py",
                 "--candidates-root", str(candidates),
                 "--reference-root", str(reference),
-                "--kernel-objects", str(kernel),
                 "--test-bin", str(test_bin),
                 "--results-dir", str(results),
             ]

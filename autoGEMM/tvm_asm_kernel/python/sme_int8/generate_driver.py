@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Render constrained INT8 SME CBLAS driver candidates and build bundles.
 
-The generated driver owns the public CBLAS ABI.  The packers and SME kernel
-remain source files in the supplied reference root and are compiled unchanged
-by the emitted Makefile.
+The generated driver owns the public CBLAS ABI.  Every bundle also carries the
+validated SME kernel and packer sources embedded in autoGEMM, so the emitted
+Makefile compiles them without caller-supplied object files.
 
 All candidate-search knobs live in ``baseline_config.json``.  In particular,
 ``search_space.p``, ``search_space.r``, and the paired
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from string import Template
 from typing import Any, Dict, Tuple
@@ -25,6 +26,17 @@ MODULE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = MODULE_DIR / "baseline_config.json"
 DRIVER_TEMPLATE = MODULE_DIR / "driver.c.tmpl"
 MAKEFILE_TEMPLATE = MODULE_DIR / "Makefile.tmpl"
+EMBEDDED_ASSEMBLY_DIR = MODULE_DIR / "assembly"
+EMBEDDED_ASSEMBLY_FILES = (
+    "gemm_ncopy_unzip.S",
+    "gemm_sme_base.S",
+    "gemm_sme_nn.S",
+    "gemm_sme_nt.S",
+    "gemm_sme_packing.S",
+    "gemm_sme_reg_defs.h",
+    "gemm_tcopy_zip.S",
+    "int8_gemm_common.S",
+)
 
 # These are implementation constraints of the current SME driver, rather than
 # hidden tuning choices.  The tuneable tile and thread-group values are read
@@ -228,6 +240,34 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def embedded_assembly_hashes() -> Dict[str, str]:
+    """Return the immutable baseline-source inventory shipped with autoGEMM."""
+    missing = [
+        str(EMBEDDED_ASSEMBLY_DIR / name)
+        for name in EMBEDDED_ASSEMBLY_FILES
+        if not (EMBEDDED_ASSEMBLY_DIR / name).is_file()
+    ]
+    if missing:
+        raise ValueError("embedded SME assembly source is missing: %s" % ", ".join(missing))
+    return {
+        name: sha256(EMBEDDED_ASSEMBLY_DIR / name)
+        for name in EMBEDDED_ASSEMBLY_FILES
+    }
+
+
+def copy_embedded_assembly(output: Path) -> Dict[str, str]:
+    """Copy the exact built-in SME baseline into one isolated candidate bundle."""
+    hashes = embedded_assembly_hashes()
+    destination = output / "assembly"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name, expected_hash in hashes.items():
+        target = destination / name
+        shutil.copy2(EMBEDDED_ASSEMBLY_DIR / name, target)
+        if sha256(target) != expected_hash:
+            raise RuntimeError("copied SME assembly hash does not match: %s" % target)
+    return hashes
+
+
 def candidate_id(config: Dict[str, Any]) -> str:
     driver = config["driver"]
     return "sme-int8-k%d-p%d-r%d-j%d-t%dx%d" % (
@@ -302,7 +342,12 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="ascii")
 
 
-def build_manifest(config_path: Path, config: Dict[str, Any], reference_root: str) -> Dict[str, Any]:
+def build_manifest(
+    config_path: Path,
+    config: Dict[str, Any],
+    reference_root: str,
+    assembly_hashes: Dict[str, str],
+) -> Dict[str, Any]:
     return {
         "schema_version": 1,
         "generator": str(Path(__file__).relative_to(MODULE_DIR.parent.parent)),
@@ -313,6 +358,9 @@ def build_manifest(config_path: Path, config: Dict[str, Any], reference_root: st
         "makefile_template_sha256": sha256(MAKEFILE_TEMPLATE),
         "expected_dynamic_export": config["abi"]["export"],
         "kernel_sources_are_unmodified": True,
+        "kernel_source_mode": "autogemm_embedded_assembly",
+        "assembly_sources": list(EMBEDDED_ASSEMBLY_FILES),
+        "assembly_source_sha256": assembly_hashes,
         "target_shapes": config["shapes"],
         "driver": config["driver"],
         "driver_synchronization": {
@@ -344,8 +392,11 @@ def write_bundle(
     (output / "Makefile").write_text(
         MAKEFILE_TEMPLATE.read_text(encoding="ascii"), encoding="ascii"
     )
+    assembly_hashes = copy_embedded_assembly(output)
     write_json(output / "config.json", config)
-    manifest = build_manifest(output / "config.json", config, reference_root)
+    manifest = build_manifest(
+        output / "config.json", config, reference_root, assembly_hashes
+    )
     write_json(output / "manifest.json", manifest)
     return manifest
 

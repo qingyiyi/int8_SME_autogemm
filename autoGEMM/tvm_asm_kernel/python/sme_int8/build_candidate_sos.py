@@ -3,8 +3,8 @@
 
 This command deliberately never starts ``test_unigemm`` and never refers to
 the test project's source tree.  It emits one generated CBLAS driver per
-P/R/thread-group candidate declared in ``baseline_config.json``, links it with
-the caller-supplied, already validated SME objects, and publishes a flat
+P/R/thread-group candidate declared in ``baseline_config.json``, compiles the
+validated SME sources bundled with autoGEMM, and publishes a flat
 ``libraries/*.so`` directory for a separate test step.
 """
 
@@ -85,16 +85,14 @@ def check_export(library: Path) -> None:
 def make_build_command(
     bundle: Path,
     reference_root: Path,
-    kernel_objects: Sequence[Path],
     compiler: str | None,
 ) -> List[str]:
-    """Build one bundle without compiling or linking the test executable."""
+    """Build one self-contained source bundle without starting the test binary."""
     command = [
         "make",
         "-C",
         str(bundle),
         "REF_ROOT=%s" % reference_root,
-        "KERNEL_OBJECTS=%s" % " ".join(str(path) for path in kernel_objects),
     ]
     if compiler:
         command.append("SME_CC=%s" % compiler)
@@ -224,8 +222,6 @@ def parse_args() -> argparse.Namespace:
                         help="candidate source, build log, and .so output directory")
     parser.add_argument("--reference-root", type=Path, required=True,
                         help="int8gemm-kblas root containing int8_gemm.h")
-    parser.add_argument("--kernel-objects", type=Path, nargs="+", required=True,
-                        help="validated SME kernel/A-pack/B-pack object files")
     parser.add_argument("--sme-cc", default=None,
                         help="optional BiSheng-clang path passed to generated Makefiles")
     parser.add_argument("--p-values", default=None,
@@ -244,16 +240,12 @@ def main() -> int:
     output = args.output.resolve()
     reference_root = args.reference_root.resolve()
     config_path = args.config.resolve()
-    kernel_objects = [path.resolve() for path in args.kernel_objects]
 
     try:
         if args.build_timeout <= 0:
             raise ValueError("--build-timeout must be greater than zero")
         if not reference_root.is_dir():
             raise ValueError("reference root is not a directory: %s" % reference_root)
-        missing_objects = [str(path) for path in kernel_objects if not path.is_file()]
-        if missing_objects:
-            raise ValueError("kernel object does not exist: %s" % ", ".join(missing_objects))
         if output.exists() and not output.is_dir():
             raise ValueError("output exists and is not a directory: %s" % output)
         if output.exists() and any(output.iterdir()) and not args.force:
@@ -278,7 +270,7 @@ def main() -> int:
         "kind": "sme_int8_candidate_build",
         "test_binary_was_not_started": True,
         "reference_root": str(reference_root),
-        "kernel_objects": [str(path) for path in kernel_objects],
+        "kernel_source_mode": "autogemm_embedded_assembly",
         "compiler": args.sme_cc,
         "output": str(output),
         "libraries_dir": str(output / "libraries"),
@@ -290,7 +282,7 @@ def main() -> int:
         bundle = output / candidate["bundle_dir"]
         library = bundle / GENERATED_LIBRARY_NAME
         flat_library = output / "libraries" / (identifier + ".so")
-        command = make_build_command(bundle, reference_root, kernel_objects, args.sme_cc)
+        command = make_build_command(bundle, reference_root, args.sme_cc)
         print("构建候选 %s" % identifier, flush=True)
         result = run_command(command, args.build_timeout)
         log = output / "logs" / (identifier + ".build.log")
