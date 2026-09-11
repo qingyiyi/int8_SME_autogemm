@@ -54,9 +54,12 @@ int main() {
         const auto check = [&](int32_t value, unsigned mode) {
             const int actual = fusion_test::inverse_fp64(value, mode);
             const int expected = fusion_test::inverse_integer(value, mode);
-            require(actual == expected, "inverse mismatch: C=" + std::to_string(value) +
+            const int fused_scalar = fusion_test::inverse_fused_scalar_model(value, mode);
+            require(actual == expected && fused_scalar == expected,
+                    "inverse mismatch: C=" + std::to_string(value) +
                     " mode=" + std::to_string(mode) + " fp64=" + std::to_string(actual) +
-                    " integer=" + std::to_string(expected));
+                    " integer=" + std::to_string(expected) +
+                    " fused_scalar=" + std::to_string(fused_scalar));
             ++checked;
         };
         std::mt19937 rng(20260910);

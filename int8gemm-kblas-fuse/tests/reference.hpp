@@ -57,6 +57,24 @@ inline int8_t inverse_integer(int32_t value, unsigned mode) {
     return static_cast<int8_t>(remainder);
 }
 
+// Host model of the phase-1 scalar post-store assembly.  It deliberately
+// follows `sdiv` + `msub` and the two signed correction branches rather than
+// using `%`, so this test catches a future change in the assembly algorithm.
+inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
+    check_mode(mode);
+    if (mode == 0) return low_byte(value);
+    const int32_t p = kModuli[mode - 1];
+    const int32_t half = p >> 1;
+    const int32_t quotient = value / p;  // AArch64 SDIV truncates toward zero.
+    int32_t remainder = value - quotient * p;  // AArch64 MSUB result.
+    if (remainder > half) {
+        remainder -= p;
+    } else if (remainder + half < 0) {
+        remainder += p;
+    }
+    return static_cast<int8_t>(remainder);
+}
+
 // Column-major NN, alpha=1, beta=0, zero offsets, K fixed to 2048.
 // Return a tightly packed column-major C, independently of the tested ldc.
 inline std::vector<int32_t> gemm_reference(
