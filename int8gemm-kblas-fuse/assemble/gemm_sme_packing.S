@@ -359,8 +359,8 @@ add	offset_pfc, offset_pfc, #64
 .endm
 #endif
 #include "./gemm_sme_base.S"
-#ifdef FUSED_INVERSE_SCALING
-#include "./gemm_sme_fused_store.S"
+#ifdef INT8_INVERSE_SCALING_EPILOGUE
+#include "./gemm_sme_inverse_scaling.S"
 #endif
 	/*******************************************************************************
 	 * Macro definitions
@@ -376,9 +376,9 @@ add	offset_pfc, offset_pfc, #64
 	KERNEL_GEMM_START
 
 .END_OF_GEMM:
-#ifdef FUSED_INVERSE_SCALING
+#ifdef INT8_INVERSE_SCALING_EPILOGUE
     STOP_SME_FEATURE
-    FUSED_INVERSE_SCALING_POSTSTORE
+    INT8_INVERSE_SCALING_POSTSTORE
 #else
     STOP_SME_FEATURE
 #endif

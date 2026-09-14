@@ -3,4 +3,4 @@
 /test_kblas_gemm
 /tests/test_reference
 
-/tests/test_fused_driver_host
+/tests/test_production_driver_host

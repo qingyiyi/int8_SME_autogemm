@@ -8,30 +8,12 @@
 int nthreadsM = 32;
 int nthreadsN = 1;
 
-struct int2 {
-        int x;
-        int y;
-    };
-constexpr int2 MODULI_I[19] = {
-        {255, 16843009},
-        {253, 16976155},
-        {251, 17111423},
-        {247, 17388531},
-        {241, 17821441},
-        {239, 17970574},
-        {233, 18433336},
-        {229, 18755315},
-        {227, 18920560},
-        {223, 19259943},
-        {217, 19792476},
-        {211, 20355295},
-        {199, 21582750},
-        {197, 21801864},
-        {193, 22253716},
-        {191, 22486739},
-        {181, 23729101},
-        {179, 23994230},
-        {173, 24826400},
+// The assembly epilogue receives the selected modulus, not the mode index.
+// Keep this small dispatch table in the driver; all arithmetic remains in the
+// GEMM assembly.  The business contract uses num_moduli in [0, 19].
+constexpr int32_t INVERSE_SCALING_MODULI[19] = {
+        255, 253, 251, 247, 241, 239, 233, 229, 227, 223,
+        217, 211, 199, 197, 193, 191, 181, 179, 173,
 };
 
 /*************** util func ********************/
@@ -93,7 +75,7 @@ typedef struct {
 // P 是M维度， Q是K维度，R是N维度
 // WARNING: 可以改成256
 #define LEVEL3_GEMM_P 128
-static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG mask, const BLASLONG *rangeM, const BLASLONG *rangeN, int8_t *C8i_j, size_t ldc8i, unsigned num_moduli)
+static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG mask, const BLASLONG *rangeM, const BLASLONG *rangeN, int8_t *C8i_j, size_t ldc8i, int32_t modulus)
 {
     
     int thread_id = omp_get_thread_num();
@@ -124,14 +106,6 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
     int threads = nthreadsM;
     int Jblock = 32;
     FLOAT ** bufferB = (FLOAT**)(args->common);
-
-    //inverse scaling
-    double p_d, inv_p_d;
-    if(num_moduli != 0){
-        int2 pi = MODULI_I[num_moduli - 1];
-        p_d     = static_cast<double>(pi.x);
-        inv_p_d = 1.0 / p_d;
-    }
 
     for (js = nFrom; js < nTo; js += minJ) {
         //printf("NFROM %d %d\n",nFrom, nTo);
@@ -187,24 +161,22 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
                     if (minJJ > Jblock){
                         minJJ = Jblock;
                     }
-                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda, bufbb + nypos*minL*minJ + (jj - js) * minL, ldb, c, ldc, is, jj, NULL);
+                    // K=2048 is one complete K panel for this production
+                    // contract.  The original NN GEMM symbol stores C32 and
+                    // then performs inverse scaling plus the C8 store in its
+                    // assembly epilogue before returning.
+                    Int8FusedStoreParams store_params{};
+                    store_params.c32 = c + is + jj * ldc;
+                    store_params.c8 = C8i_j + is + jj * static_cast<BLASLONG>(ldc8i);
+                    store_params.ldc32 = ldc;
+                    store_params.ldc8 = static_cast<int64_t>(ldc8i);
+                    store_params.rows = minI;
+                    store_params.cols = minJJ;
+                    store_params.modulus = modulus;
 
-                    //inverse scaling
-                    for(size_t iii = is; iii< is + minI; ++iii){
-                        for (size_t jjj = jj; jjj < jj + minJJ; ++jjj) {
-                            if(num_moduli != 0){
-                                const double val_d = static_cast<double>(c[jjj * ldc + iii]);
-                                const double q  = std::rint(val_d * inv_p_d);
-                                const double dl = std::fma(-p_d, q, val_d);
-                                C8i_j[jjj * ldc8i + iii] = static_cast<int8_t>(dl);
-                            }
-                            else
-                            {
-                                C8i_j[jjj * ldc8i + iii] = static_cast<int8_t>(c[jjj * ldc + iii] & 255);
-                            }
-                        }
-                    }
-                    //inverse scaling
+                    KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda,
+                                         bufbb + nypos*minL*minJ + (jj - js) * minL,
+                                         ldb, c, ldc, is, jj, &store_params);
 
                 }
             }
@@ -270,11 +242,14 @@ void cblas_gemm_s8s8s32( const CBLAS_LAYOUT layout,
     memset(job_t, 0, nthreads * nthreads * sizeof(int*));
 
     newArgs.common = (void*)job_t;
+    const int32_t modulus = num_moduli == 0
+        ? 0
+        : INVERSE_SCALING_MODULI[num_moduli - 1];
     /* Execute parallel computation */
     // ExecBlas(nthreads, queue);
     #pragma omp parallel for num_threads(nthreads) schedule(static) shared(sa, sb)
     for (int i = 0; i < nthreads; i++) {
         int thread_id = omp_get_thread_num();
-        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P * thread_id), sb, mask, rangeM, rangeN, C8i_j, ldc8i, num_moduli);
+        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P * thread_id), sb, mask, rangeM, rangeN, C8i_j, ldc8i, modulus);
     }
 }

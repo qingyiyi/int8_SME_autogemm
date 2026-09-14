@@ -1,157 +1,144 @@
-# INT8 GEMM + inverse scaling 分阶段融合
+# INT8 GEMM + inverse-scaling epilogue
 
-## 范围、接口与当前状态
+## 适用范围
 
-本次只覆盖以下实际业务合同：
+当前生产路径只承诺以下调用合同：
 
-- `K` **固定为 2048**；不支持多 K-panel 的部分和再做 inverse scaling。
-- 阶段 1 验收的 `M/N` 仅为 `2048` 的倍数，当前测试程序允许
-  `2048 / 4096 / 6144 / 8192`；重点用例是 **`8192 × 8192 × 2048`**。
-- 输入继续使用现有列主序 NN、`alpha=1`、`beta=0`、A/B/C 偏移为 0 的合同。
-- 下游最终只消费 `INT8`。不过**阶段 1 仍保留 C32 shadow 输出**，仅用于与已验证原路径逐元素对照；此阶段不能传 `C == nullptr`。
-- `num_moduli=0` 表示保留 C32 的低 8 位；`1…19` 对应既有的 19 个奇数模数，结果必须与原 FP64 `rint + fma` 路径逐元素一致。
+- `K` 固定为 `2048`，一次 GEMM 调用对应一个完整的 K panel。
+- `M`、`N` 为正数，且都是 `2048` 的倍数；当前重点尺寸是
+  `8192 × 8192 × 2048`。
+- 列主序 NN，`alpha=1`、`beta=0`，A/B offset 为 0。
+- `num_moduli=0`：将 C32 结果写入 C8 的低 8 位；
+  `num_moduli=1..19`：使用原实现的 19 个奇数模数，结果与原来的
+  FP64 `rint + fma` inverse-scaling 逐元素一致。
+- C8 是下游消费的最终结果。当前实现仍保留原有 C32 tile store，C32 同时作为
+  可观测的中间结果和 inverse-scaling 的输入；本版本还没有做 C32-free 优化。
 
-**阶段 1 代码已完成，但尚未在 ARM SME 目标机实际汇编和运行验收。**
+不在本合同内的尺寸（例如非 2048 倍数）不应作为生产验收条件，也不要为了这些
+尺寸改动已经确认正确的 GEMM 累加、packing 或分块逻辑。
 
-- 用户已确认正确的
-  `/rjs/cxz/huawei/int8gemm-kblas-fuse/int8_gemm.cpp` **没有被修改**。
-  `make verify-original-driver` 会校验它的冻结 SHA-256。
-- 阶段 1 新增了独立入口 `cblas_gemm_s8s8s32_fused()` 和独立 SME 符号
-  `int8_sme_gemm_kernel_nn_fused()`；原始入口与原始 kernel 保持为对照基线。
-- fused API 只在 `K=2048` 且 `M/N` 均为正的 `2048` 倍数时进入新路径；其余
-  尺寸直接回退到原 API，因此不会把阶段 1 用于历史的 `512×64` 问题。
-- fused kernel 目前的流程是：
+## 生产实现
 
-  ```text
-  原 SME GEMM 计算 ZA → 原有 C32 store → kernel 内读取本 tile 的 C32
-  → inverse scaling → C8 store → 返回
-  ```
+现在只有一条生产 API/内核路径：
 
-  因此它是安全的 **shadow fused** 版本，不是最终的 C32-free 优化版本。
-  这样一旦出现不一致，可以先比较 C32，再比较 C8，定位边界清晰。
+```text
+cblas_gemm_s8s8s32()
+    -> 原有 INT8 SME packing 与 GEMM 累加
+    -> 原有 C32 tile store
+    -> GEMM 汇编 epilogue：inverse scaling
+    -> C8 tile store
+```
 
-不为历史上的 `M=512, N=64, K=2048, threads=32` 基线失败修改
-`int8_gemm.cpp`：该尺寸不属于本次业务合同，也不应作为阶段 1 的准入条件。
+`int8_gemm.cpp` 不再包含 C++ inverse-scaling 双重循环，也不再包含浮点
+`rint/fma` 计算。它只负责：
 
-## 分阶段交付与停点
+1. 按 `num_moduli` 选择 modulus；
+2. 为当前 GEMM tile 填充 `Int8FusedStoreParams`；
+3. 通过原 NN kernel 的既有 `buf` 参数把该结构传给汇编。
 
-| 阶段 | 交付 | 正确性门槛 |
-| --- | --- | --- |
-| 0 | 冻结已确认正确的原始 driver/kernel | `int8_gemm.cpp` 的哈希一致；原路径只作为对照，不为非业务尺寸改动 |
-| 1（当前） | 独立 fused API；保留 C32 store，在同一次 kernel 调用结束前生成 C8 | 原始路径与 fused 路径的 C32、C8、padding/guard、A/B 输入全部精确一致 |
-| 2 | 将 inverse scaling 移近 ZA/寄存器结果，仍暂时保留 C32 诊断 store | 阶段 1 的全部逐元素测试继续通过，并单独测量性能变化 |
-| 3 | 去掉 C32 store/read，形成只写 C8 的最终路径 | 以独立 C32 oracle / 阶段 1 金样为依据，C8 精确一致；接口不再依赖 C32 |
+inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生产
+`assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编使用 signed
+integer division (`sdiv`)、余数重构 (`msub`) 和 centered-remainder 修正；这与
+19 个正奇数模数下的原 FP64 语义一致。`modulus=0` 路径直接写 C32 的低字节。
 
-每一阶段失败都停在当前阶段修复；不把性能优化和语义改动叠加在同一次修改中。
+没有独立的 fused C++ API、fused kernel 符号、shadow driver 或阶段性 fallback。
+原有的 GEMM 累加和 packing 代码保持不变。
 
-## 已有的本机检查（不等于 SME 验收）
+### 汇编 ABI
 
-在当前 x86 主机可执行：
+`Int8FusedStoreParams` 通过 kernel 的第 11 个参数传递，布局必须保持为：
+
+| offset | 字段 | 含义 |
+|---:|---|---|
+| 0 | `c32` | 当前 C32 tile 首地址 |
+| 8 | `c8` | 当前 C8 tile 首地址 |
+| 16 | `ldc32` | C32 leading dimension（元素数） |
+| 24 | `ldc8` | C8 leading dimension（元素数） |
+| 32 | `rows` | 当前 tile 有效行数 |
+| 40 | `cols` | 当前 tile 有效列数 |
+| 48 | `modulus` | 0 或选中的正奇数模数 |
+| 52 | `reserved` | 保留 |
+
+当前 epilogue 在正常 C32 store 完成后读取 `sp+184` 的 `buf` 参数，因此不能
+改变原 kernel 的栈参数布局，不能把 C32 store 简单删除后继续复用本 ABI。
+
+## 本机验证（不执行 SME 汇编）
+
+x86 主机可运行独立 oracle 和 C++ driver wiring 检查：
 
 ```bash
 cd /rjs/cxz/huawei/int8gemm-kblas-fuse
-make test-host
+make clean
+make -B test-host
 ```
 
-它会运行两类检查：
+该命令验证：
 
-```text
-PASS host reference: 1711831 inverse cases; guard fault injection; fixed-K GEMM oracle.
-This is NOT an SME kernel acceptance test.
-PASS host fused-driver mock: fixed-K tiling, business-shape fallback, C32/C8 tile addresses, strides, modes, padding and 1/32-thread paths verified.
-```
+- FP64 reference、整数 centered-remainder oracle、所有 19 个模数和低字节路径；
+- INT32 边界、guard/padding 和固定 K=2048 的参考 GEMM；
+- 生产 C++ driver 的 tile 地址、`ldc32 != ldc8`、modulus 传递、1/32 线程分块；
+- C++ 返回后不会再次执行 inverse-scaling（mock kernel 写入 marker）。
 
-- `tests/test_reference.cpp`：冻结原 FP64 inverse scaling、独立整数 centered-remainder oracle、与阶段 1 `sdiv + msub` 分支等价的标量模型、INT32 极值和保护区检查。
-- `tests/test_fused_driver_host.cpp`：以 mock packer/kernel 编译独立 fused C++ driver，验证 K=2048 分块、非业务尺寸回退原 API、C32/C8 tile 地址、`ldc32 != ldc8`、模式到模数映射、padding，以及 1/32 线程路径。
-- 两者都**不执行** AArch64 SME 汇编，不能替代目标机验收。
+host 测试不具备 AArch64 SME 指令执行能力，所以不能替代目标机验收。
 
-本机还已确认 `make test` 的链接输入只包含原始 base 对象；它不会链接
-`int8_gemm_fused.o` 或 `gemm_sme_nn_fused.o`。阶段 1 对照程序仅由
-`make test-stage1` 构建。
+## ARM SME 目标机验证
 
-## ARM SME 目标机：阶段 1 验收顺序
-
-目标机需要现有 BiSheng/OpenMP/NUMA/HBM 环境和支持 INT8 SME 的 CPU。
-下面的 `/rjs/cxz/huawei/int8gemm-kblas-fuse` 是当前工作区路径；复制到其他
-目录时请替换路径。
-
-### 1. 确认原 driver 没有被触碰，并强制重建 fused 测试
+目标机上必须强制重建，确保 `gemm_sme_inverse_scaling.S` 被重新包含：
 
 ```bash
 cd /rjs/cxz/huawei/int8gemm-kblas-fuse
-make verify-original-driver
-make -B test-stage1
+make clean
+make -B test
+make -B test-driver-host
+make check
 ```
 
-`make test-stage1` 只构建；它不会执行测试。`-B` 用于确保汇编 include 文件
-发生变化后不会复用旧对象。
-
-若目标机的编译器路径不同，可覆盖 `GCC_DIR`，或者直接覆盖 `CC` / `CXX`；
-本次没有新增系统库依赖，也不会自动安装任何依赖。
-
-### 2. 先验证最低风险的低字节路径
+先跑 2048 基准尺寸，再跑用户重点尺寸：
 
 ```bash
-./test_fused_stage1 \
-  --m 2048 --n 2048 --threads 32 \
-  --modes 0 --repeat 1 --seed 42
+./test_kblas_gemm --m 2048 --n 2048 --threads 1  --repeat 1 --seed 42
+./test_kblas_gemm --m 2048 --n 2048 --threads 32 --repeat 1 --seed 42
+./test_kblas_gemm --m 8192 --n 8192 --threads 32 --modes 0,1,19 --repeat 1 --seed 42
 ```
 
-### 3. 再验证两个有代表性的模数 inverse scaling 路径
+也可以使用 Makefile 封装的命令：
 
 ```bash
-./test_fused_stage1 \
-  --m 2048 --n 2048 --threads 32 \
-  --modes 1,19 --repeat 1 --seed 42
+make verify
+make verify-large
 ```
 
-### 4. 在小业务尺寸覆盖全部 20 个模式
+2048 验证默认覆盖 `num_moduli=0..19`；`make verify-large` 默认在 8192 重点尺寸
+覆盖低字节路径和模数表两端（`--modes 0,1,19`），需要全模数回归时可显式传
+`--modes all`。测试对每个实际 C32 元素穷举检查
+`C8 == inverse_scaling(C32)`，并检查 C32/C8 的 padding/guard 以及 A/B 输入不被
+修改。由于业务最小尺寸已经是 `2048 × 2048`，测试不会尝试构造不可用的
+`M × N × K` 标量 reference；它会在每个 2048 块边界、128 行/32 列 kernel 边界
+和确定性的内部坐标上运行独立 C32 点 reference。C32 的完整 GEMM 累加路径仍以
+已经验证过的原始实现为准。自定义 `--m/--n` 必须是正的 2048 倍数，最大为 8192；
+32 线程路径还要求 `N` 能被 32 整除。
 
-```bash
-./test_fused_stage1 \
-  --m 2048 --n 2048 --threads 32 \
-  --modes all --repeat 1 --seed 42
-```
-
-### 5. 最后跑实际重点尺寸
-
-```bash
-./test_fused_stage1 \
-  --m 8192 --n 8192 --threads 32 \
-  --modes 0,1,19 --repeat 1 --seed 42
-```
-
-成功时程序输出：
+目标机成功时应看到类似：
 
 ```text
-STAGE1 PASS: ... original-vs-fused calls exact; C32 shadow, C8, guards and inputs verified.
+PRODUCTION PASS: ... business-shape cases; K=2048, modes=....
 ```
 
-阶段 1 程序刻意使用不同的 `ldc32` 和 `ldc8`，并检查 C32/C8 前后 guard、列间
-padding 和 A/B 输入未被改写。对 `8192 × 8192 × 2048`，它不重新做极慢的朴素
-完整 GEMM；它以用户已确认正确的原 GEMM 为 C32 对照，并对每一个 C32/C8 元素执行
-独立 inverse-scaling oracle 校验。
+若失败，请保留完整的第一条 `RUN ...` 和 `PRODUCTION FAIL: ...` 输出，以及
+编译器报告的第一处汇编/链接错误。优先检查：
 
-若失败，请保留完整的第一条 `RUN STAGE1 ...` 和 `STAGE1 FAIL: ...` 输出，尤其是
-`mode`、`row`、`col`、`C32`、`C8`、`integer8`。若是汇编/链接失败，也请保留完整
-命令和第一处报错；可额外检查：
+- 是否执行了 `make clean && make -B test`；
+- `nm test_kblas_gemm | grep int8_sme_gemm_kernel_nn` 是否存在生产 NN 符号；
+- SVE VL/SME SVL 是否均为 64 bytes；
+- OpenMP 是否确实创建了 1 或 32 个线程；
+- 进程是否保持 `FE_TONEAREST`。
 
-```bash
-nm test_fused_stage1 | grep int8_sme_gemm_kernel_nn_fused
-```
+## 文件说明
 
-不要用旧的 `verify TEST_ARGS='--suite smoke/full'` 作为本次阶段 1 的通过条件：
-其中含有本次不支持、且用户不需要的非 `2048` 倍数尺寸。
-
-## 阶段 1 实现约束
-
-- 不修改 `/rjs/cxz/huawei/int8gemm-kblas-fuse/int8_gemm.cpp`。
-- 原 API `cblas_gemm_s8s8s32()`、原 SME kernel 和 `make test` 保持为基线对照；
-  只有显式调用 `cblas_gemm_s8s8s32_fused()` / `test_fused_stage1`，且尺寸满足
-  `K=2048`、`M/N` 为正的 `2048` 倍数时，才进入 fused 路径。
-- `Int8FusedStoreParams` 是 C++ 到汇编的稳定 ABI：包含 C32/C8 tile 首地址、两套
-  leading dimension、有效 rows/cols 和模数。C8 的列步长绝不能误用 C32 的步长。
-- 阶段 1 的模数实现使用整数 signed division + centered remainder。因为 19 个模数
-  全为正奇数，整数输入不存在 0.5 tie；它与既有 FP64 `rint + fma` 结果等价。
-- 最终删除 C32 store 时，必须同步检查原 kernel 的 C 指针计算、预取和参数合同；
-  不能仅仅把 C32 store 指令删掉后就允许 `C == nullptr`。
+- `int8_gemm.cpp`：原生产 driver；只新增汇编 epilogue 所需的 tile 参数传递。
+- `int8_gemm.hpp`：kernel 声明和 C++/汇编共享 ABI。
+- `assemble/gemm_sme_nn.S`：生产 NN 符号入口。
+- `assemble/gemm_sme_inverse_scaling.S`：inverse-scaling epilogue。
+- `test_int8gemm_kblas.cpp`：目标机生产路径验收程序。
+- `tests/test_reference.cpp`、`tests/reference.hpp`：可移植 reference/oracle。
+- `tests/test_production_driver_host.cpp`：不执行 SME 指令的 driver wiring mock。

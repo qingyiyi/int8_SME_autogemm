@@ -57,7 +57,7 @@ inline int8_t inverse_integer(int32_t value, unsigned mode) {
     return static_cast<int8_t>(remainder);
 }
 
-// Host model of the phase-1 scalar post-store assembly.  It deliberately
+// Host model of the production scalar inverse-scaling epilogue.  It deliberately
 // follows `sdiv` + `msub` and the two signed correction branches rather than
 // using `%`, so this test catches a future change in the assembly algorithm.
 inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
@@ -75,23 +75,34 @@ inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
     return static_cast<int8_t>(remainder);
 }
 
+// One independently computed element of a column-major NN GEMM.  The target
+// acceptance test uses this bounded oracle at tile corners rather than trying
+// to materialize a scalar M*N*K reference for the 2048/8192 business shapes.
+inline int32_t gemm_reference_element(
+    const int8_t* a, int lda, const int8_t* b, int ldb, int row, int col) {
+    int64_t sum = 0;
+    for (int l = 0; l < kFixedK; ++l) {
+        sum += static_cast<int64_t>(a[static_cast<size_t>(l) * lda + row]) *
+               b[static_cast<size_t>(col) * ldb + l];
+    }
+    if (sum < std::numeric_limits<int32_t>::min() ||
+        sum > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("reference GEMM exceeds int32 range");
+    }
+    return static_cast<int32_t>(sum);
+}
+
 // Column-major NN, alpha=1, beta=0, zero offsets, K fixed to 2048.
 // Return a tightly packed column-major C, independently of the tested ldc.
+// This remains useful for small host-only oracle tests; production-size target
+// tests should use gemm_reference_element() at a bounded set of coordinates.
 inline std::vector<int32_t> gemm_reference(
     int m, int n, const int8_t* a, int lda, const int8_t* b, int ldb) {
     std::vector<int32_t> result(static_cast<size_t>(m) * n);
     for (int j = 0; j < n; ++j) {
         for (int i = 0; i < m; ++i) {
-            int64_t sum = 0;
-            for (int l = 0; l < kFixedK; ++l) {
-                sum += static_cast<int64_t>(a[static_cast<size_t>(l) * lda + i]) *
-                       b[static_cast<size_t>(j) * ldb + l];
-            }
-            if (sum < std::numeric_limits<int32_t>::min() ||
-                sum > std::numeric_limits<int32_t>::max()) {
-                throw std::overflow_error("reference GEMM exceeds int32 range");
-            }
-            result[static_cast<size_t>(j) * m + i] = static_cast<int32_t>(sum);
+            result[static_cast<size_t>(j) * m + i] =
+                gemm_reference_element(a, lda, b, ldb, i, j);
         }
     }
     return result;

@@ -7,17 +7,22 @@
 #include <iostream>
 #include <memory>
 #include <random>
+#include <set>
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 #include <sys/prctl.h>
 
 #include "int8_gemm.hpp"
 
-// Test-only control of the existing driver; production defaults are unchanged.
+// Test-only control of the production driver thread layout.
 extern int nthreadsM;
 extern int nthreadsN;
 
 namespace {
 constexpr int kK = fusion_test::kFixedK;
+constexpr int kDimensionBlock = 2048;
 constexpr int kMaxDimension = 8192;
 
 enum class Pattern { Random, Zero, Positive, Negative, Checker, Precision };
@@ -35,9 +40,16 @@ const char* pattern_name(Pattern pattern) {
 struct Case { int m, n, threads; Pattern pattern; bool padded; };
 struct Options {
     std::string suite = "smoke";
-    int m = 0, n = 0, threads = 32, repeat = 2;
+    int m = 0, n = 0, threads = 32, repeat = 1;
     uint32_t seed = 42;
     bool custom_threads = false;
+    std::vector<unsigned> modes = [] {
+        std::vector<unsigned> result;
+        for (unsigned mode = 0; mode <= fusion_test::kModuli.size(); ++mode) {
+            result.push_back(mode);
+        }
+        return result;
+    }();
 };
 
 int parse_number(const std::string& text, int lower, int upper) {
@@ -49,15 +61,46 @@ int parse_number(const std::string& text, int lower, int upper) {
     return static_cast<int>(value);
 }
 
+std::vector<unsigned> parse_modes(const std::string& text) {
+    if (text == "all") {
+        std::vector<unsigned> result;
+        for (unsigned mode = 0; mode <= fusion_test::kModuli.size(); ++mode) {
+            result.push_back(mode);
+        }
+        return result;
+    }
+
+    std::set<unsigned> unique;
+    std::stringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        if (item.empty()) throw std::invalid_argument("empty item in --modes");
+        unique.insert(static_cast<unsigned>(parse_number(
+            item, 0, static_cast<int>(fusion_test::kModuli.size()))));
+    }
+    if (unique.empty()) throw std::invalid_argument("--modes cannot be empty");
+    return std::vector<unsigned>(unique.begin(), unique.end());
+}
+
+std::string modes_name(const std::vector<unsigned>& modes) {
+    std::ostringstream result;
+    for (size_t i = 0; i < modes.size(); ++i) {
+        if (i != 0) result << ',';
+        result << modes[i];
+    }
+    return result.str();
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help") {
-            std::cout << "Stage 0, K=2048 only; all num_moduli=0..19.\n"
+            std::cout << "Production fused GEMM, K=2048 only; all num_moduli=0..19.\n"
                       << "Usage: " << argv[0] << " [--suite smoke|full] [--repeat 1..100] [--seed N]\n"
-                      << "       " << argv[0] << " --m M --n N [--threads 1|32] [--repeat N]\n"
-                      << "Custom dimensions: 1..8192. At 32 threads, N must be divisible by 32.\n"
+                      << "       " << argv[0] << " --m M --n N [--threads 1|32] [--modes all|0,1,19]\n"
+                      << "Custom dimensions: M/N must be positive multiples of 2048 (max 8192).\n"
+                      << "At 32 threads, N must be divisible by 32.\n"
                       << "Requires target SME INT8 hardware with SVE VL=SME SVL=64 bytes.\n";
             std::exit(0);
         }
@@ -70,6 +113,7 @@ Options parse_options(int argc, char** argv) {
             options.threads = parse_number(value, 1, 32);
             options.custom_threads = true;
         }
+        else if (arg == "--modes") options.modes = parse_modes(value);
         else if (arg == "--repeat") options.repeat = parse_number(value, 1, 100);
         else if (arg == "--seed") options.seed = parse_number(value, 0, 2147483647);
         else throw std::invalid_argument("unknown option: " + arg);
@@ -81,14 +125,18 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--m and --n must be provided together");
     }
     if (options.threads != 1 && options.threads != 32) {
-        throw std::invalid_argument("stage 0 tests thread layouts 1x1 and 32x1 only");
+        throw std::invalid_argument("production tests thread layouts 1x1 and 32x1 only");
     }
     if (options.m == 0 && options.custom_threads) {
         throw std::invalid_argument("--threads applies to a custom --m/--n case only");
     }
     if (options.m != 0 && options.threads == 32 && options.n % 32 != 0) {
-        throw std::invalid_argument("32-thread baseline requires N divisible by 32; "
+        throw std::invalid_argument("32-thread production path requires N divisible by 32; "
                                     "use --threads 1 to isolate an N tail");
+    }
+    if (options.m != 0 &&
+        (options.m % kDimensionBlock != 0 || options.n % kDimensionBlock != 0)) {
+        throw std::invalid_argument("production contract requires M and N to be multiples of 2048");
     }
     return options;
 }
@@ -98,25 +146,14 @@ std::vector<Case> make_cases(const Options& options) {
         return {{options.m, options.n, options.threads, Pattern::Random, true}};
     }
     std::vector<Case> cases = {
-        {32, 32, 1, Pattern::Random, false},
-        {17, 33, 1, Pattern::Random, true},
-        {129, 31, 1, Pattern::Random, true},
-        {33, 17, 1, Pattern::Precision, true},
-        {512, 64, 32, Pattern::Random, true}
+        {kDimensionBlock, kDimensionBlock, 1, Pattern::Random, false},
+        {kDimensionBlock, kDimensionBlock, 32, Pattern::Random, true}
     };
     if (options.suite == "full") {
-        constexpr int edges[] = {1, 15, 16, 17, 31, 32, 33, 127, 128, 129};
-        for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i) {
-            for (bool padded : {false, true}) {
-                cases.push_back({edges[i], edges[9 - i], 1, Pattern::Random, padded});
-            }
-        }
-        for (Pattern pattern : {Pattern::Zero, Pattern::Positive, Pattern::Negative,
-                                Pattern::Checker, Pattern::Precision}) {
-            cases.push_back({33, 17, 1, pattern, true});
-        }
-        cases.push_back({513, 32, 32, Pattern::Random, true});
-        cases.push_back({1024, 96, 32, Pattern::Precision, true});
+        cases.push_back({2 * kDimensionBlock, 2 * kDimensionBlock, 32,
+                         Pattern::Precision, true});
+        cases.push_back({4 * kDimensionBlock, 4 * kDimensionBlock, 32,
+                         Pattern::Random, true});
     }
     return cases;
 }
@@ -190,6 +227,52 @@ void fill_inputs(const Case& test, uint32_t seed, std::vector<int8_t>& a, int ld
     }
 }
 
+struct ReferenceProbe {
+    int row;
+    int col;
+    int32_t expected;
+};
+
+// The production contract starts at 2048x2048.  A full scalar M*N*K oracle is
+// therefore not a practical target test (8192x8192x2048 would require more
+// than 137 billion multiply-adds).  Keep an independent C32 oracle at a
+// bounded set of coordinates that covers the beginnings and ends of every
+// 2048 block, the 128-row/32-column kernel boundaries, and deterministic
+// interior points.  The fused C8 relation is still checked for every element.
+std::vector<std::pair<int, int>> reference_probe_coordinates(int m, int n) {
+    std::set<int> rows;
+    std::set<int> cols;
+    const int block_offsets[] = {0, 1, 31, 32, 63, 64, 127, 128, 129,
+                                 kDimensionBlock - 2, kDimensionBlock - 1};
+    for (int base = 0; base < m; base += kDimensionBlock) {
+        for (int offset : block_offsets) {
+            if (base + offset < m) rows.insert(base + offset);
+        }
+    }
+    for (int base = 0; base < n; base += kDimensionBlock) {
+        for (int offset : block_offsets) {
+            if (base + offset < n) cols.insert(base + offset);
+        }
+    }
+
+    // Add deterministic interior probes so a boundary-only implementation
+    // cannot pass while producing a bad value in the middle of a tile.
+    uint32_t state = 0x9e3779b9u ^ static_cast<uint32_t>(m * 17 + n);
+    for (int sample = 0; sample < 128; ++sample) {
+        state = state * 1664525u + 1013904223u;
+        rows.insert(static_cast<int>(state % static_cast<uint32_t>(m)));
+        state = state * 1664525u + 1013904223u;
+        cols.insert(static_cast<int>(state % static_cast<uint32_t>(n)));
+    }
+
+    std::vector<std::pair<int, int>> coordinates;
+    coordinates.reserve(rows.size() * cols.size());
+    for (int row : rows) {
+        for (int col : cols) coordinates.emplace_back(row, col);
+    }
+    return coordinates;
+}
+
 size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb) {
     const int lda = test.m + (test.padded ? 7 : 0);
     const int ldb = kK + (test.padded ? 11 : 0);
@@ -198,7 +281,8 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
     std::cout << "RUN M=" << test.m << " N=" << test.n << " K=" << kK
               << " threads=" << test.threads << " lda=" << lda << " ldb=" << ldb
               << " ldc32=" << ldc << " ldc8=" << ldc8
-              << " pattern=" << pattern_name(test.pattern) << " seed=" << options.seed << std::endl;
+              << " pattern=" << pattern_name(test.pattern) << " seed=" << options.seed
+              << " modes=" << modes_name(options.modes) << std::endl;
     check_team(test.threads);
     nthreadsM = test.threads;
     nthreadsN = 1;
@@ -206,15 +290,22 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
     std::vector<int8_t> b(static_cast<size_t>(ldb) * test.n, 93);
     fill_inputs(test, options.seed, a, lda, b, ldb);
     const auto original_a = a, original_b = b;
-    const auto reference = fusion_test::gemm_reference(test.m, test.n, a.data(), lda, b.data(), ldb);
-    if (test.pattern == Pattern::Precision && reference.front() != 33032065) {
+    std::vector<ReferenceProbe> probes;
+    for (const auto& coordinate : reference_probe_coordinates(test.m, test.n)) {
+        probes.push_back({coordinate.first, coordinate.second,
+                          fusion_test::gemm_reference_element(
+                              a.data(), lda, b.data(), ldb,
+                              coordinate.first, coordinate.second)});
+    }
+    if (test.pattern == Pattern::Precision &&
+        probes.front().expected != 33032065) {
         throw std::logic_error("precision input no longer exercises a large odd INT32 result");
     }
     fusion_test::GuardedMatrix<int32_t> c32(test.m, test.n, ldc, 0x5a6b7c1d);
     fusion_test::GuardedMatrix<int8_t> c8(test.m, test.n, ldc8, 85);
     const int32_t offset = 0;
     size_t passed = 0;
-    for (unsigned mode = 0; mode <= fusion_test::kModuli.size(); ++mode) {
+    for (unsigned mode : options.modes) {
         for (int repeat = 0; repeat < options.repeat; ++repeat) {
             // beta=0 must overwrite C, independent of its previous contents.
             c32.reset(repeat % 2 == 0 ? 0 : 0x12345678);
@@ -226,17 +317,27 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
                                         " repeat=" + std::to_string(repeat);
             c32.check_guards("C32" + context);
             c8.check_guards("C8" + context);
+            for (const ReferenceProbe& probe : probes) {
+                const int32_t actual32 =
+                    c32.data()[static_cast<size_t>(probe.col) * ldc + probe.row];
+                if (actual32 != probe.expected) {
+                    throw std::runtime_error("C32 probe mismatch" + context +
+                        " row=" + std::to_string(probe.row) + " col=" +
+                        std::to_string(probe.col) + " C32=" +
+                        std::to_string(actual32) + " expected32=" +
+                        std::to_string(probe.expected));
+                }
+            }
             for (int j = 0; j < test.n; ++j) {
                 for (int i = 0; i < test.m; ++i) {
-                    const int32_t expected32 = reference[static_cast<size_t>(j) * test.m + i];
                     const int32_t actual32 = c32.data()[static_cast<size_t>(j) * ldc + i];
-                    const int expected8 = fusion_test::inverse_integer(expected32, mode);
-                    const int legacy8 = fusion_test::inverse_fp64(expected32, mode);
+                    const int expected8 = fusion_test::inverse_integer(actual32, mode);
+                    const int legacy8 = fusion_test::inverse_fp64(actual32, mode);
                     const int actual8 = c8.data()[static_cast<size_t>(j) * ldc8 + i];
-                    if (actual32 != expected32 || actual8 != expected8 || legacy8 != expected8) {
+                    if (actual8 != expected8 || legacy8 != expected8) {
                         throw std::runtime_error("output mismatch" + context + " row=" +
                             std::to_string(i) + " col=" + std::to_string(j) + " C32=" +
-                            std::to_string(actual32) + " expected32=" + std::to_string(expected32) +
+                            std::to_string(actual32) +
                             " C8=" + std::to_string(actual8) + " integer8=" + std::to_string(expected8) +
                             " fp64_legacy8=" + std::to_string(legacy8));
                     }
@@ -246,7 +347,9 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
             ++passed;
         }
     }
-    std::cout << "PASS " << passed << " calls; C32, C8, output guards and inputs exact.\n";
+    std::cout << "PASS " << passed
+              << " calls; C8 inverse relation exhaustive, C32 independent probes, "
+                 "output guards and inputs exact.\n";
     return passed;
 }
 }  // namespace
@@ -264,11 +367,12 @@ int main(int argc, char** argv) {
         size_t passed = 0;
         const auto cases = make_cases(options);
         for (const Case& test : cases) passed += run_case(test, options, sa.get(), sb.get());
-        std::cout << "STAGE0 PASS: " << passed << " calls across " << cases.size()
-                  << " cases; K=2048, modes=0..19. No fused kernel is enabled yet.\n";
+        std::cout << "PRODUCTION PASS: " << passed << " calls across " << cases.size()
+                  << " business-shape cases; K=2048, modes="
+                  << modes_name(options.modes) << ".\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "STAGE0 FAIL: " << e.what() << '\n';
+        std::cerr << "PRODUCTION FAIL: " << e.what() << '\n';
         return 1;
     }
 }

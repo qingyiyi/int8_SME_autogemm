@@ -118,8 +118,8 @@ typedef enum CBLAS_OFFSET {
 /************** cblas.h *******************/
 
 
-// Phase-1 fused-store ABI.  The fused kernel receives a pointer to this
-// structure through its existing 11th (buf) argument.  Keep this layout
+// Production inverse-scaling store ABI.  The NN kernel receives a pointer to
+// this structure through its existing 11th (buf) argument.  Keep this layout
 // stable: the assembly uses the byte offsets below after the normal 176-byte
 // register save area.
 struct Int8FusedStoreParams {
@@ -150,13 +150,6 @@ extern "C" {
         int32_t *c, BLASLONG ldc, void *buf
     );
 
-    void int8_sme_gemm_kernel_nn_fused(
-        BLASLONG m, BLASLONG n, BLASLONG k,
-        void *sa, BLASLONG lda, float alpha,
-        void *sb, BLASLONG ldb,
-        int32_t *c, BLASLONG ldc, void *buf
-    );
-
     void cblas_gemm_s8s8s32(
         const CBLAS_LAYOUT layout,
         const CBLAS_TRANSPOSE transa,
@@ -179,36 +172,6 @@ extern "C" {
         int8_t *sa,
         int8_t *sb,
         int8_t *C8i_j, 
-        size_t ldc8i,
-        unsigned num_moduli
-    );
-
-    // Phase 1 shadow path: same public arguments as the existing API, but
-    // inverse scaling is performed by the fused kernel after each K=2048 tile.
-    // For unsupported K values the implementation falls back to the original
-    // API so the existing contract is preserved.
-    void cblas_gemm_s8s8s32_fused(
-        const CBLAS_LAYOUT layout,
-        const CBLAS_TRANSPOSE transa,
-        const CBLAS_TRANSPOSE transb,
-        const CBLAS_OFFSET offsetc,
-        const BLASINT m,
-        const BLASINT n,
-        const BLASINT k,
-        const float alpha,
-        void *a_,
-        const BLASINT lda,
-        const BLASINT8 oa,
-        void *b_,
-        const BLASINT ldb,
-        const BLASINT8 ob,
-        const float beta,
-        int32_t *c,
-        const BLASINT ldc,
-        const int32_t *oc,
-        int8_t *sa,
-        int8_t *sb,
-        int8_t *C8i_j,
         size_t ldc8i,
         unsigned num_moduli
     );
