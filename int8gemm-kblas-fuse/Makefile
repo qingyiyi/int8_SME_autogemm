@@ -85,7 +85,7 @@ $(TARGET): $(BASE_OBJS)
 	$(CC) -shared $(OPENMP) -o $@ $^ -lm -lpthread -lnuma
 	@echo ">>> 生成成功: $@"
 	@echo ">>> 导出符号:"
-	@nm -D $@ | grep -E "cblas_gemm_s8s8s32|int8_sme_gemm" || echo "警告: 未找到目标符号!"
+	@nm -D $@ | grep -E "cblas_gemm_s8s8s8|int8_sme_gemm" || echo "警告: 未找到目标符号!"
 
 # Target executable: build only; `verify` runs it.
 test: $(TEST_TARGET)
@@ -157,4 +157,4 @@ clean:
 	       $(HOST_TEST) $(PRODUCTION_DRIVER_TEST)
 # 快速检查
 check: $(TARGET)
-	nm -D $(TARGET) | grep -E 'cblas_gemm_s8s8s32($$|_)'
+	nm -D $(TARGET) | grep -E 'cblas_gemm_s8s8s8($$|_)'

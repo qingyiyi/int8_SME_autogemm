@@ -72,7 +72,7 @@
 
     // q = trunc(value / p), with SDIV's required destructive numerator.
     dup     \tmp_mod\().s, w6
-    mov     \tmp_q\().s, \value\().s
+    mov     \tmp_q\().d, \value\().d
     sdiv    \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s, \tmp_mod\().s
 
     // value <- value - q*p (MLS is the predicated destructive form).

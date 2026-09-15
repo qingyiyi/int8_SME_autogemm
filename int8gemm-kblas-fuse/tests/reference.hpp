@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-#include <vector>
 
 namespace fusion_test {
 
@@ -78,7 +77,7 @@ inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
 // One independently computed element of a column-major NN GEMM.  The target
 // acceptance test uses this bounded oracle at tile corners rather than trying
 // to materialize a scalar M*N*K reference for the 2048/8192 business shapes.
-inline int32_t gemm_reference_element(
+inline int32_t accumulator_reference_element(
     const int8_t* a, int lda, const int8_t* b, int ldb, int row, int col) {
     int64_t sum = 0;
     for (int l = 0; l < kFixedK; ++l) {
@@ -92,21 +91,6 @@ inline int32_t gemm_reference_element(
     return static_cast<int32_t>(sum);
 }
 
-// Column-major NN, alpha=1, beta=0, zero offsets, K fixed to 2048.
-// Return a tightly packed column-major C, independently of the tested ldc.
-// This remains useful for small host-only oracle tests; production-size target
-// tests should use gemm_reference_element() at a bounded set of coordinates.
-inline std::vector<int32_t> gemm_reference(
-    int m, int n, const int8_t* a, int lda, const int8_t* b, int ldb) {
-    std::vector<int32_t> result(static_cast<size_t>(m) * n);
-    for (int j = 0; j < n; ++j) {
-        for (int i = 0; i < m; ++i) {
-            result[static_cast<size_t>(j) * m + i] =
-                gemm_reference_element(a, lda, b, ldb, i, j);
-        }
-    }
-    return result;
-}
 
 }  // namespace fusion_test
 #endif

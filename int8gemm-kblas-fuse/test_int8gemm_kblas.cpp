@@ -230,15 +230,15 @@ void fill_inputs(const Case& test, uint32_t seed, std::vector<int8_t>& a, int ld
 struct ReferenceProbe {
     int row;
     int col;
-    int32_t expected;
+    int32_t accumulator;
 };
 
 // The production contract starts at 2048x2048.  A full scalar M*N*K oracle is
 // therefore not a practical target test (8192x8192x2048 would require more
-// than 137 billion multiply-adds).  Keep an independent C32 GEMM oracle at a
+// than 137 billion multiply-adds).  Keep an independent accumulator oracle at a
 // bounded set of coordinates that covers the beginnings and ends of every
 // 2048 block, the 128-row/32-column kernel boundaries, and deterministic
-// interior points.  In the C32-free production path, each such result is
+// interior points.  Each transient INT32 accumulator is inverse-scaled
 // inverse-scaled independently and compared with its directly written C8 lane.
 std::vector<std::pair<int, int>> reference_probe_coordinates(int m, int n) {
     std::set<int> rows;
@@ -293,38 +293,37 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
     std::vector<ReferenceProbe> probes;
     for (const auto& coordinate : reference_probe_coordinates(test.m, test.n)) {
         probes.push_back({coordinate.first, coordinate.second,
-                          fusion_test::gemm_reference_element(
+                          fusion_test::accumulator_reference_element(
                               a.data(), lda, b.data(), ldb,
                               coordinate.first, coordinate.second)});
     }
     if (test.pattern == Pattern::Precision &&
-        probes.front().expected != 33032065) {
+        probes.front().accumulator != 33032065) {
         throw std::logic_error("precision input no longer exercises a large odd INT32 result");
     }
-    // Production owns only the final INT8 output.  The C32 reference exists
-    // only as bounded independent probes above; no C32 matrix is allocated or
-    // passed to the production driver.
+    // Production owns only the final INT8 output.  The bounded oracle above
+    // retains transient scalar accumulators only; it never allocates or passes
+    // an INT32 output matrix to the production driver.
     fusion_test::GuardedMatrix<int8_t> c8(test.m, test.n, ldc8, 85);
-    const int32_t offset = 0;
     size_t passed = 0;
     for (unsigned mode : options.modes) {
         for (int repeat = 0; repeat < options.repeat; ++repeat) {
             c8.reset(repeat % 2 == 0 ? -91 : 91);
-            cblas_gemm_s8s8s32(CblasColMajor, CblasNoTrans, CblasNoTrans, CblasFixOffset,
+            cblas_gemm_s8s8s8(CblasColMajor, CblasNoTrans, CblasNoTrans,
                 test.m, test.n, kK, 1.0f, a.data(), lda, 0, b.data(), ldb, 0, 0.0f,
-                nullptr, 0, &offset, sa, sb, c8.data(), static_cast<size_t>(ldc8), mode);
+                sa, sb, c8.data(), static_cast<size_t>(ldc8), mode);
             const std::string context = " mode=" + std::to_string(mode) +
                                         " repeat=" + std::to_string(repeat);
             c8.check_guards("C8" + context);
             for (const ReferenceProbe& probe : probes) {
-                const int expected8 = fusion_test::inverse_integer(probe.expected, mode);
-                const int legacy8 = fusion_test::inverse_fp64(probe.expected, mode);
+                const int expected8 = fusion_test::inverse_integer(probe.accumulator, mode);
+                const int legacy8 = fusion_test::inverse_fp64(probe.accumulator, mode);
                 const int actual8 = c8.data()[static_cast<size_t>(probe.col) * ldc8 + probe.row];
                 if (actual8 != expected8 || legacy8 != expected8) {
                     throw std::runtime_error("C8 probe mismatch" + context +
                         " row=" + std::to_string(probe.row) + " col=" +
-                        std::to_string(probe.col) + " expected32=" +
-                        std::to_string(probe.expected) + " C8=" +
+                        std::to_string(probe.col) + " accumulator=" +
+                        std::to_string(probe.accumulator) + " C8=" +
                         std::to_string(actual8) + " integer8=" +
                         std::to_string(expected8) + " fp64_legacy8=" +
                         std::to_string(legacy8));

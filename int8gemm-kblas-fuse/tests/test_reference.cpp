@@ -29,18 +29,19 @@ void test_guards() {
     matrix.check_guards("reset");
 }
 
-void test_gemm_oracle() {
+void test_accumulator_oracle() {
     constexpr int m = 3, n = 2, lda = 5, ldb = fusion_test::kFixedK + 7;
     std::vector<int8_t> a(lda * fusion_test::kFixedK, 99), b(ldb * n, 99);
     for (int l = 0; l < fusion_test::kFixedK; ++l) {
         for (int i = 0; i < m; ++i) a[l * lda + i] = static_cast<int8_t>(i - 1);
         for (int j = 0; j < n; ++j) b[j * ldb + l] = static_cast<int8_t>(j + 2);
     }
-    const auto result = fusion_test::gemm_reference(m, n, a.data(), lda, b.data(), ldb);
     for (int j = 0; j < n; ++j) {
         for (int i = 0; i < m; ++i) {
-            require(result[j * m + i] == (i - 1) * (j + 2) * fusion_test::kFixedK,
-                    "GEMM oracle layout/stride mismatch");
+            const int32_t accumulator = fusion_test::accumulator_reference_element(
+                a.data(), lda, b.data(), ldb, i, j);
+            require(accumulator == (i - 1) * (j + 2) * fusion_test::kFixedK,
+                    "accumulator oracle layout/stride mismatch");
         }
     }
 }
@@ -102,9 +103,9 @@ int main() {
             require(caught, "invalid mode was not rejected by reference");
         }
         test_guards();
-        test_gemm_oracle();
+        test_accumulator_oracle();
         std::cout << "PASS host reference: " << checked
-                  << " inverse cases; guard fault injection; fixed-K GEMM oracle.\n"
+                  << " inverse cases; guard fault injection; fixed-K accumulator oracle.\n"
                   << "This is NOT an SME kernel acceptance test.\n";
         return 0;
     } catch (const std::exception& e) {

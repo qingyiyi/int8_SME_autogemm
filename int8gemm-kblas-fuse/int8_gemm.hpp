@@ -110,11 +110,6 @@ typedef enum CBLAS_TRANSPOSE {
     CblasConjTrans = 113, // conjugate transpose
     CblasConjNoTrans = 114
 } CBLAS_TRANSPOSE;
-typedef enum CBLAS_OFFSET {
-    CblasRowOffset = 171,
-    CblasColOffset = 172,
-    CblasFixOffset = 173
-} CBLAS_OFFSET;
 /************** cblas.h *******************/
 
 
@@ -136,18 +131,23 @@ static_assert(offsetof(Int8FusedStoreParams, modulus) == 8, "fused ABI modulus o
 static_assert(sizeof(Int8FusedStoreParams) == 16, "fused ABI size");
 
 extern "C" {
+    // These two output arguments are C8 storage, even though the unchanged
+    // assembly traversal internally treats their addresses as a virtual
+    // four-byte accumulator coordinate plane.
     void int8_sme_gemm_kernel_nn(
         BLASLONG m, BLASLONG n, BLASLONG k,
         void *sa, BLASLONG lda, float alpha,
         void *sb, BLASLONG ldb,
-        void *c, BLASLONG ldc, void *buf
+        int8_t *c8, BLASLONG ldc8, void *store_params
     );
 
-    void cblas_gemm_s8s8s32(
+    // Fixed-contract fused API: S8 x S8 GEMM followed by inverse scaling to
+    // the final S8 output.  There is intentionally no C32 output pointer,
+    // C32 leading dimension, or C32 offset vector.
+    void cblas_gemm_s8s8s8(
         const CBLAS_LAYOUT layout,
         const CBLAS_TRANSPOSE transa,
         const CBLAS_TRANSPOSE transb,
-        const CBLAS_OFFSET offsetc,
         const BLASINT m,
         const BLASINT n,
         const BLASINT k,
@@ -159,74 +159,14 @@ extern "C" {
         const BLASINT ldb,
         const BLASINT8 ob,
         const float beta,
-        int32_t *c,
-        const BLASINT ldc,
-        const int32_t *oc,
         int8_t *sa,
         int8_t *sb,
-        int8_t *C8i_j, 
-        size_t ldc8i,
+        int8_t *c8,
+        size_t ldc8,
         unsigned num_moduli
     );
 
 }
-
-
-
-typedef struct {
-    const void *a;
-    void *b;
-    void *c;
-    void *d;
-    const void *alpha;
-    const void *beta;
-    BLASLONG m, n, k;
-    BLASLONG lda, ldb, ldc, ldd;
-    BLASLONG offset;
-    BLASINT8 oa;
-    BLASINT8 ob;
-    const int32_t *oc;
-    BLASLONG computeMode;
-#if defined(SMP)
-    void *common;
-    BLASLONG nthreads;
-    bool isDoSupKernel;
-    BLASLONG smpThreshold;
-    BLASLONG unrollSz;
-    int threadIdx; // needed for L1 routines which output some reduced value, e.g. dot function
-    unsigned int transa;
-    unsigned int transb;
-    bool isDoSmallKernel;
-    BLASLONG kDirectionOption;
-    void *cTotal;
-    BLASLONG nthreadsM;
-    BLASLONG nthreadsN;
-#endif
-    FLOAT alphaR;
-    FLOAT alphaI;
-    BLASLONG lastMthreads;
-    BLASLONG mblockNumLast;
-    BLASULONG mask;
-} BlasArgs;
-
-
-typedef struct BlasQueue_ {
-    void *routine;
-    BLASLONG position;
-    BLASLONG assigned;
-    size_t bufSize;
-
-    const BlasArgs *args;
-    const void *rangeM;
-    const void *rangeN;
-    void *sa, *sb;
-
-    struct BlasQueue_ *next;
-    volatile int** job_t;
-
-    unsigned int mode;
-    int status;
-}BlasQueue;
 
 
 

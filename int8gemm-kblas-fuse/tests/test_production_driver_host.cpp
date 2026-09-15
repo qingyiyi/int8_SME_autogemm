@@ -1,6 +1,6 @@
 // Portable production-driver test.  It replaces the target-only packers and
 // SME kernel with strict mocks, so it verifies that the original
-// cblas_gemm_s8s8s32() driver passes the C32-free fused-store ABI to the
+// cblas_gemm_s8s8s8() driver passes the C8-only fused-store ABI to the
 // original NN kernel symbol.  It does NOT execute AArch64 SME assembly.
 #include "tests/reference.hpp"
 #include "int8_gemm.hpp"
@@ -51,7 +51,7 @@ void require(bool condition, const std::string& message) {
     if (!condition) fail(message);
 }
 
-int32_t expected_c32(int row, int col) {
+int32_t expected_accumulator(int row, int col) {
     // Keep values far from padding and exercise positive/negative remainders.
     return static_cast<int32_t>(((row * 131 + col * 17 + 7) % 100003) - 50001);
 }
@@ -89,7 +89,7 @@ void check_full_team(int threads) {
 // origins and partial final vectors.  This is intentionally an integer-only
 // test: the host cannot execute SME instructions, but it locks down the key
 // coordinate conversion independently of the driver mock below.
-void verify_virtual_c32_to_c8_mapping() {
+void verify_virtual_word_to_c8_mapping() {
     constexpr uint64_t kSyntheticC8Base = UINT64_C(0x100000003);
     constexpr std::array<BLASLONG, 2> kMatrixSizes = {2048, 8192};
     constexpr std::array<BLASLONG, 5> kVectorBytes = {16, 32, 64, 128, 256};
@@ -134,7 +134,7 @@ void verify_virtual_c32_to_c8_mapping() {
                                         static_cast<uint64_t>(global_row) +
                                         static_cast<uint64_t>(tile_col + relative_col) * ldc8;
                                     require(helper_dst == expected_dst,
-                                            "virtual C32-to-C8 base-address mapping mismatch");
+                                            "virtual word-to-C8 base-address mapping mismatch");
 
                                     // st1b uses a prefix byte predicate built from
                                     // the active S lanes.  Every active byte must
@@ -142,7 +142,7 @@ void verify_virtual_c32_to_c8_mapping() {
                                     for (BLASLONG lane = 0; lane < active_lanes; ++lane) {
                                         require(helper_dst + static_cast<uint64_t>(lane) ==
                                                     expected_dst + static_cast<uint64_t>(lane),
-                                                "virtual C32-to-C8 vector-lane mapping mismatch");
+                                                "virtual word-to-C8 vector-lane mapping mismatch");
                                     }
                                     const uint64_t last_offset =
                                         helper_dst - kSyntheticC8Base + active_lanes - 1;
@@ -150,7 +150,7 @@ void verify_virtual_c32_to_c8_mapping() {
                                                 static_cast<uint64_t>(tile_col + relative_col) &&
                                                     last_offset % ldc8 <
                                                 static_cast<uint64_t>(matrix_m),
-                                            "virtual C32-to-C8 mapping touched C8 padding");
+                                            "virtual word-to-C8 mapping touched C8 padding");
                                 }
                             }
                         }
@@ -178,12 +178,10 @@ void run_one(unsigned mode, int threads, C8Behavior c8_behavior) {
     invocation.mode = mode;
     invocation.c8_behavior = c8_behavior;
     g_invocation = &invocation;
-    const int32_t offset = 0;
-
-    cblas_gemm_s8s8s32(
-        CblasColMajor, CblasNoTrans, CblasNoTrans, CblasFixOffset,
+    cblas_gemm_s8s8s8(
+        CblasColMajor, CblasNoTrans, CblasNoTrans,
         kM, kN, kK, 1.0f, a.data(), kLda, 0, b.data(), kLdb, 0, 0.0f,
-        nullptr, 0, &offset, sa.data(), sb.data(), c8.data(), kLdc8, mode);
+        sa.data(), sb.data(), c8.data(), kLdc8, mode);
     g_invocation = nullptr;
 
     require(!invocation.invalid.load(),
@@ -199,13 +197,13 @@ void run_one(unsigned mode, int threads, C8Behavior c8_behavior) {
 
     for (int col = 0; col < kN; ++col) {
         for (int row = 0; row < kM; ++row) {
-            const int32_t expected32 = expected_c32(row, col);
+            const int32_t accumulator = expected_accumulator(row, col);
             const int8_t expected8 = c8_behavior == C8Behavior::Inverse
-                ? fusion_test::inverse_integer(expected32, mode)
+                ? fusion_test::inverse_integer(accumulator, mode)
                 : kKernelMarker;
             const size_t c8_index = static_cast<size_t>(col) * kLdc8 + row;
             if (c8[c8_index] != expected8) {
-                fail("mocked C32-free production output mismatch mode=" +
+                fail("mocked C8-only production output mismatch mode=" +
                      std::to_string(mode) + " threads=" + std::to_string(threads) +
                      " row=" + std::to_string(row) + " col=" + std::to_string(col));
             }
@@ -235,7 +233,7 @@ extern "C" void int8_sme_gemm_oncopy(
 
 extern "C" void int8_sme_gemm_kernel_nn(
     BLASLONG rows, BLASLONG cols, BLASLONG k, void*, BLASLONG, float alpha,
-    void*, BLASLONG, void* c8, BLASLONG ldc8, void* buf) {
+    void*, BLASLONG, int8_t* c8, BLASLONG ldc8, void* buf) {
     Invocation* invocation = g_invocation;
     const auto* params = static_cast<const Int8FusedStoreParams*>(buf);
     BLASLONG base_row = 0;
@@ -254,7 +252,7 @@ extern "C" void int8_sme_gemm_kernel_nn(
 
     for (BLASLONG col = 0; col < cols; ++col) {
         for (BLASLONG row = 0; row < rows; ++row) {
-            const int32_t value = expected_c32(static_cast<int>(base_row + row),
+            const int32_t value = expected_accumulator(static_cast<int>(base_row + row),
                                                static_cast<int>(base_col + col));
             params->c8[col * ldc8 + row] =
                 invocation->c8_behavior == C8Behavior::Inverse
@@ -267,7 +265,7 @@ extern "C" void int8_sme_gemm_kernel_nn(
 
 int main() {
     try {
-        verify_virtual_c32_to_c8_mapping();
+        verify_virtual_word_to_c8_mapping();
         // All modes validate the C++ mode-to-modulus wiring on the serial path.
         for (unsigned mode = 0; mode <= fusion_test::kModuli.size(); ++mode) {
             run_one(mode, 1, C8Behavior::Inverse);
@@ -280,8 +278,8 @@ int main() {
         // a C++ inverse-scaling loop still runs after the kernel returns, this
         // marker would be overwritten and this call fails.
         run_one(1, 1, C8Behavior::Marker);
-        std::cout << "PASS host production-driver mock: virtual C32-to-C8 address "
-                     "mapping, original API wiring, all moduli, C8 stride, padding, "
+        std::cout << "PASS host production-driver mock: virtual word-to-C8 address "
+                     "mapping, C8-only API wiring, all moduli, C8 stride, padding, "
                      "1/32-thread tiling, and absence of a post-kernel C++ "
                      "inverse-scaling pass verified.\n";
         return 0;
