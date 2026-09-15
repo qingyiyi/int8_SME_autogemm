@@ -1,8 +1,11 @@
 #include "int8_gemm.hpp"
 
-#define KERNEL_OPERATION_SME(M, N, K, ALPHA, SA, LDA, SB, LDB, C, LDC, X, Y, BUF) \
-    int8_sme_gemm_kernel_nn                                       \
-    (M, N, K, SA, LDA, ALPHA[0], (FLOAT *)SB, LDB, (int32_t *)(C) + ((X) + (Y) * (LDC)) * COMPSIZE, LDC, BUF)
+// The NN assembly keeps its established C/ldc register slots for output
+// traversal, but in the fused path they carry the current C8 tile address and
+// its byte stride.  No C32 pointer arithmetic or C32 store remains in C++.
+#define KERNEL_OPERATION_SME(M, N, K, ALPHA, SA, LDA, SB, LDB, C8, LDC8, BUF) \
+    int8_sme_gemm_kernel_nn                                                     \
+    (M, N, K, SA, LDA, ALPHA[0], (FLOAT *)SB, LDB, C8, LDC8, BUF)
 
 //WARNING: 可以改成16X2
 int nthreadsM = 32;
@@ -88,9 +91,6 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
     BLASLONG lda = args->lda;
     FLOAT *b = (FLOAT *)args->b;
     BLASLONG ldb = args->ldb;
-    FLOATC *c = (FLOATC *)args->c;
-    BLASLONG ldc = args->ldc;
-
     float *alpha = (float *)args->alpha;   // alpha = 1
 
 
@@ -162,21 +162,20 @@ static void SmeGemmDriver(const BlasArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG 
                         minJJ = Jblock;
                     }
                     // K=2048 is one complete K panel for this production
-                    // contract.  The original NN GEMM symbol stores C32 and
-                    // then performs inverse scaling plus the C8 store in its
-                    // assembly epilogue before returning.
+                    // contract.  Give the proven kernel traversal a virtual
+                    // C32 coordinate plane rooted at this C8 tile; the fused
+                    // assembly never dereferences it as C32 and writes C8
+                    // directly from ZA after inverse scaling.
+                    int8_t *const c8_tile =
+                        C8i_j + is + jj * static_cast<BLASLONG>(ldc8i);
                     Int8FusedStoreParams store_params{};
-                    store_params.c32 = c + is + jj * ldc;
-                    store_params.c8 = C8i_j + is + jj * static_cast<BLASLONG>(ldc8i);
-                    store_params.ldc32 = ldc;
-                    store_params.ldc8 = static_cast<int64_t>(ldc8i);
-                    store_params.rows = minI;
-                    store_params.cols = minJJ;
+                    store_params.c8 = c8_tile;
                     store_params.modulus = modulus;
 
                     KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda,
                                          bufbb + nypos*minL*minJ + (jj - js) * minL,
-                                         ldb, c, ldc, is, jj, &store_params);
+                                         ldb, c8_tile, static_cast<BLASLONG>(ldc8i),
+                                         &store_params);
 
                 }
             }
@@ -210,6 +209,11 @@ void cblas_gemm_s8s8s32( const CBLAS_LAYOUT layout,
     unsigned num_moduli
 )
 {
+    // The public C32 arguments are retained for source/ABI compatibility only.
+    // Production callers that consume C8 exclusively may pass c=nullptr, ldc=0.
+    (void)c;
+    (void)ldc;
+
     int nthreads = nthreadsM * nthreadsN;
     // 初始化一个args，包含 nthread， m
     BlasArgs newArgs;
@@ -220,13 +224,11 @@ void cblas_gemm_s8s8s32( const CBLAS_LAYOUT layout,
     newArgs.nthreads = nthreads;
     newArgs.a = a_;
     newArgs.b = b_;
-    newArgs.c = c;
     newArgs.m = m;
     newArgs.n = n;
     newArgs.k = k;
     newArgs.lda = lda;
     newArgs.ldb = ldb;
-    newArgs.ldc = ldc;
     newArgs.oa = oa;
     newArgs.ob = ob;
     newArgs.oc = oc;

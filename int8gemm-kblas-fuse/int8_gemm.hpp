@@ -119,35 +119,28 @@ typedef enum CBLAS_OFFSET {
 
 
 // Production inverse-scaling store ABI.  The NN kernel receives a pointer to
-// this structure through its existing 11th (buf) argument.  Keep this layout
-// stable: the assembly uses the byte offsets below after the normal 176-byte
-// register save area.
+// this structure through its existing 11th (buf) argument.  `c8` is the stable
+// base of the current output tile; the kernel's C/ldc argument slots themselves
+// carry the virtual INT32 coordinate plane used by the existing traversal.  The
+// helper maps that virtual coordinate back to a byte address below `c8` and
+// never dereferences it as C32.  The virtual LDC already contains the C8 stride,
+// so duplicating ldc8 in this structure would be redundant.
 struct Int8FusedStoreParams {
-    int32_t *c32;       // column-major tile origin
     int8_t *c8;         // column-major INT8 tile origin
-    int64_t ldc32;      // C32 leading dimension, in elements
-    int64_t ldc8;       // C8 leading dimension, in elements
-    int64_t rows;       // valid rows in this kernel call
-    int64_t cols;       // valid columns in this kernel call
     int32_t modulus;    // 0: low byte; otherwise centered remainder modulus
     int32_t reserved;
 };
 
-static_assert(offsetof(Int8FusedStoreParams, c32) == 0, "fused ABI c32 offset");
-static_assert(offsetof(Int8FusedStoreParams, c8) == 8, "fused ABI c8 offset");
-static_assert(offsetof(Int8FusedStoreParams, ldc32) == 16, "fused ABI ldc32 offset");
-static_assert(offsetof(Int8FusedStoreParams, ldc8) == 24, "fused ABI ldc8 offset");
-static_assert(offsetof(Int8FusedStoreParams, rows) == 32, "fused ABI rows offset");
-static_assert(offsetof(Int8FusedStoreParams, cols) == 40, "fused ABI cols offset");
-static_assert(offsetof(Int8FusedStoreParams, modulus) == 48, "fused ABI modulus offset");
-static_assert(sizeof(Int8FusedStoreParams) == 56, "fused ABI size");
+static_assert(offsetof(Int8FusedStoreParams, c8) == 0, "fused ABI c8 offset");
+static_assert(offsetof(Int8FusedStoreParams, modulus) == 8, "fused ABI modulus offset");
+static_assert(sizeof(Int8FusedStoreParams) == 16, "fused ABI size");
 
 extern "C" {
     void int8_sme_gemm_kernel_nn(
         BLASLONG m, BLASLONG n, BLASLONG k,
         void *sa, BLASLONG lda, float alpha,
         void *sb, BLASLONG ldb,
-        int32_t *c, BLASLONG ldc, void *buf
+        void *c, BLASLONG ldc, void *buf
     );
 
     void cblas_gemm_s8s8s32(

@@ -12,7 +12,13 @@
 #ifndef SAVE_ZACOL_IMPL_
 .macro SAVE_ZACOL pc,off, reg_za,base_idx,idx,nidx,reg_pg,rab0,rc0,t0,t1
 	MOVA	\rab0\().s, \reg_pg\()/M, \reg_za\()v.s[\base_idx, \idx]
+#ifdef INT8_INVERSE_SCALING_EPILOGUE
+	// The production NN path inverse-scales this just-extracted ZA vector and
+	// stores C8 directly; it never materializes a C32 output tile.
+	INT8_INVERSE_SCALING_DIRECT \pc, \off, \reg_pg, \rab0, \rc0, \t0
+#else
 	STNT1	 \rab0\().s, \reg_pg, [\pc, \off , MUL VL]
+#endif
 .endm
 #endif
 

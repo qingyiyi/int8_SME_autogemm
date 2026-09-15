@@ -291,12 +291,19 @@ add	offset_pfc, offset_pfc, #64
 	KERNEL_LDNT1D_M6 \mvl \nvl
 	
 #if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
+#ifndef INT8_INVERSE_SCALING_EPILOGUE
+	// The fused NN path passes a virtual C32 address plane; never prefetch it.
 	PRFM PLDL1KEEP, [ptrcp]  // P=128, Q=512
+#endif
     add offset_pfc, offset_pfc, #128   // P=128, Q=512
+#ifndef INT8_INVERSE_SCALING_EPILOGUE
 	PRFM PLDL1KEEP, [ptrcp, #64]
+#endif
 	add ptrcp, ptrcp, LDC
+#ifndef INT8_INVERSE_SCALING_EPILOGUE
 	PRFM PLDL1KEEP, [ptrcp]
 	PRFM PLDL1KEEP, [ptrcp, #64]
+#endif
 #endif
 
 	KERNEL_LDNT1D_M7 \mvl \nvl
@@ -358,10 +365,13 @@ add	offset_pfc, offset_pfc, #64
 	KERNEL_MM_LOOP_N h
 .endm
 #endif
-#include "./gemm_sme_base.S"
+// The direct ZA-to-C8 helper must be defined before gemm_sme_base.S
+// defines SAVE_ZACOL, because SAVE_ZACOL invokes it for the NN production
+// symbol.  The non-fused NT symbol does not define this feature macro.
 #ifdef INT8_INVERSE_SCALING_EPILOGUE
 #include "./gemm_sme_inverse_scaling.S"
 #endif
+#include "./gemm_sme_base.S"
 	/*******************************************************************************
 	 * Macro definitions
 	 *******************************************************************************/
@@ -376,12 +386,7 @@ add	offset_pfc, offset_pfc, #64
 	KERNEL_GEMM_START
 
 .END_OF_GEMM:
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
     STOP_SME_FEATURE
-    INT8_INVERSE_SCALING_POSTSTORE
-#else
-    STOP_SME_FEATURE
-#endif
 	RESTORE_REGS
 	mov w0, wzr
 	ret

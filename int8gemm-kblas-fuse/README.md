@@ -11,8 +11,10 @@
 - `num_moduli=0`：将 C32 结果写入 C8 的低 8 位；
   `num_moduli=1..19`：使用原实现的 19 个奇数模数，结果与原来的
   FP64 `rint + fma` inverse-scaling 逐元素一致。
-- C8 是下游消费的最终结果。当前实现仍保留原有 C32 tile store，C32 同时作为
-  可观测的中间结果和 inverse-scaling 的输入；本版本还没有做 C32-free 优化。
+- C8 是下游消费的最终结果。GEMM 在 ZA 中完成 INT32 累加后，汇编会从 ZA
+  取出结果向量、立即 inverse scaling 并直接写 C8；生产 NN 路径不分配、不落地
+  C32。为兼容原有 CBLAS 入口，API 保留旧的 C/ldc 参数槽；生产调用传
+  `c=nullptr, ldc=0`，汇编只把这两个槽当作内部坐标平面，绝不解引用。
 
 不在本合同内的尺寸（例如非 2048 倍数）不应作为生产验收条件，也不要为了这些
 尺寸改动已经确认正确的 GEMM 累加、packing 或分块逻辑。
@@ -23,10 +25,10 @@
 
 ```text
 cblas_gemm_s8s8s32()
-    -> 原有 INT8 SME packing 与 GEMM 累加
-    -> 原有 C32 tile store
-    -> GEMM 汇编 epilogue：inverse scaling
-    -> C8 tile store
+    -> 原有 INT8 SME packing 与 GEMM ZA INT32 累加
+    -> 从 ZA 取出 INT32 结果向量
+    -> 汇编内 inverse scaling
+    -> 直接 C8 tile store（不落地 C32）
 ```
 
 `int8_gemm.cpp` 不再包含 C++ inverse-scaling 双重循环，也不再包含浮点
@@ -37,30 +39,30 @@ cblas_gemm_s8s8s32()
 3. 通过原 NN kernel 的既有 `buf` 参数把该结构传给汇编。
 
 inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生产
-`assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编使用 signed
-integer division (`sdiv`)、余数重构 (`msub`) 和 centered-remainder 修正；这与
-19 个正奇数模数下的原 FP64 语义一致。`modulus=0` 路径直接写 C32 的低字节。
+`assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编在每个 ZA
+结果向量刚被 `MOVA` 取出后，使用 signed integer division (`sdiv`)、余数重构
+(`mls`) 和 centered-remainder 修正；这与 19 个正奇数模数下的原 FP64 语义一致。
+`modulus=0` 路径直接写该 INT32 向量的低字节。
 
 没有独立的 fused C++ API、fused kernel 符号、shadow driver 或阶段性 fallback。
 原有的 GEMM 累加和 packing 代码保持不变。
 
 ### 汇编 ABI
 
-`Int8FusedStoreParams` 通过 kernel 的第 11 个参数传递，布局必须保持为：
+`Int8FusedStoreParams` 通过 kernel 的现有 `buf` 参数传递，布局必须保持为：
 
 | offset | 字段 | 含义 |
 |---:|---|---|
-| 0 | `c32` | 当前 C32 tile 首地址 |
-| 8 | `c8` | 当前 C8 tile 首地址 |
-| 16 | `ldc32` | C32 leading dimension（元素数） |
-| 24 | `ldc8` | C8 leading dimension（元素数） |
-| 32 | `rows` | 当前 tile 有效行数 |
-| 40 | `cols` | 当前 tile 有效列数 |
-| 48 | `modulus` | 0 或选中的正奇数模数 |
-| 52 | `reserved` | 保留 |
+| 0 | `c8` | 当前 C8 tile 首地址 |
+| 8 | `modulus` | 0 或选中的正奇数模数 |
+| 12 | `reserved` | 保留 |
 
-当前 epilogue 在正常 C32 store 完成后读取 `sp+184` 的 `buf` 参数，因此不能
-改变原 kernel 的栈参数布局，不能把 C32 store 简单删除后继续复用本 ABI。
+结构体总大小为 16 bytes。生产 driver 为每个 NN tile 创建该参数块，并把当前
+C8 tile 首地址和 `ldc8` 传给 kernel 的 C/ldc 槽。原 kernel 的 C 指针遍历仍按
+已验证的 INT32 坐标平面推进；汇编将其字节位移除以 4，直接得到相对于 `c8`
+的字节位移，因此不需要在参数块中重复保存 `ldc8`。这些虚拟地址从不被
+`ldr/str` 解引用。`buf` 的实际栈位置由现有 prologue/save-area 约定确定，修改
+kernel 参数顺序或 `SAVE_REGS` 布局时必须同步更新汇编。
 
 ## 本机验证（不执行 SME 汇编）
 
@@ -76,8 +78,10 @@ make -B test-host
 
 - FP64 reference、整数 centered-remainder oracle、所有 19 个模数和低字节路径；
 - INT32 边界、guard/padding 和固定 K=2048 的参考 GEMM；
-- 生产 C++ driver 的 tile 地址、`ldc32 != ldc8`、modulus 传递、1/32 线程分块；
-- C++ 返回后不会再次执行 inverse-scaling（mock kernel 写入 marker）。
+- 生产 C++ driver 的 C8 tile 地址、C8 stride、modulus 传递和 1/32 线程分块；
+- 虚拟 C32 坐标到 C8 字节地址的 `>> 2` 转换：覆盖 2048/8192、非 4 字节对齐的
+  C8 stride、SAVE_ZACOL 的 0..3 个 VL 偏移、16..256-byte VL、tile 边界与尾向量；
+- mock kernel 写入 marker，确认 C++ 返回后没有隐藏的 inverse-scaling pass。
 
 host 测试不具备 AArch64 SME 指令执行能力，所以不能替代目标机验收。
 
@@ -110,13 +114,13 @@ make verify-large
 
 2048 验证默认覆盖 `num_moduli=0..19`；`make verify-large` 默认在 8192 重点尺寸
 覆盖低字节路径和模数表两端（`--modes 0,1,19`），需要全模数回归时可显式传
-`--modes all`。测试对每个实际 C32 元素穷举检查
-`C8 == inverse_scaling(C32)`，并检查 C32/C8 的 padding/guard 以及 A/B 输入不被
-修改。由于业务最小尺寸已经是 `2048 × 2048`，测试不会尝试构造不可用的
-`M × N × K` 标量 reference；它会在每个 2048 块边界、128 行/32 列 kernel 边界
-和确定性的内部坐标上运行独立 C32 点 reference。C32 的完整 GEMM 累加路径仍以
-已经验证过的原始实现为准。自定义 `--m/--n` 必须是正的 2048 倍数，最大为 8192；
-32 线程路径还要求 `N` 能被 32 整除。
+`--modes all`。测试只分配最终 C8，并检查 C8 的 padding/guard 以及 A/B 输入不被
+修改；不会分配或检查生产 C32。由于业务最小尺寸已经是 `2048 × 2048`，测试不会
+尝试构造不可用的 `M × N × K` 标量 reference；它会在每个 2048 块边界、128 行/32
+列 kernel 边界和确定性的内部坐标上运行独立 C32 点 GEMM reference，再用独立
+inverse-scaling oracle 验证直接写入的 C8。C32 的完整 GEMM 累加路径仍以已验证的
+原始实现为准。自定义 `--m/--n` 必须是正的 2048 倍数，最大为 8192；32 线程路径
+还要求 `N` 能被 32 整除。
 
 目标机成功时应看到类似：
 

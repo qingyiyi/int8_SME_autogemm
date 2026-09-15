@@ -235,10 +235,11 @@ struct ReferenceProbe {
 
 // The production contract starts at 2048x2048.  A full scalar M*N*K oracle is
 // therefore not a practical target test (8192x8192x2048 would require more
-// than 137 billion multiply-adds).  Keep an independent C32 oracle at a
+// than 137 billion multiply-adds).  Keep an independent C32 GEMM oracle at a
 // bounded set of coordinates that covers the beginnings and ends of every
 // 2048 block, the 128-row/32-column kernel boundaries, and deterministic
-// interior points.  The fused C8 relation is still checked for every element.
+// interior points.  In the C32-free production path, each such result is
+// inverse-scaled independently and compared with its directly written C8 lane.
 std::vector<std::pair<int, int>> reference_probe_coordinates(int m, int n) {
     std::set<int> rows;
     std::set<int> cols;
@@ -276,11 +277,10 @@ std::vector<std::pair<int, int>> reference_probe_coordinates(int m, int n) {
 size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb) {
     const int lda = test.m + (test.padded ? 7 : 0);
     const int ldb = kK + (test.padded ? 11 : 0);
-    const int ldc = test.m + (test.padded ? 16 : 0);
     const int ldc8 = test.m + (test.padded ? 23 : 0);
     std::cout << "RUN M=" << test.m << " N=" << test.n << " K=" << kK
               << " threads=" << test.threads << " lda=" << lda << " ldb=" << ldb
-              << " ldc32=" << ldc << " ldc8=" << ldc8
+              << " ldc8=" << ldc8
               << " pattern=" << pattern_name(test.pattern) << " seed=" << options.seed
               << " modes=" << modes_name(options.modes) << std::endl;
     check_team(test.threads);
@@ -301,46 +301,33 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
         probes.front().expected != 33032065) {
         throw std::logic_error("precision input no longer exercises a large odd INT32 result");
     }
-    fusion_test::GuardedMatrix<int32_t> c32(test.m, test.n, ldc, 0x5a6b7c1d);
+    // Production owns only the final INT8 output.  The C32 reference exists
+    // only as bounded independent probes above; no C32 matrix is allocated or
+    // passed to the production driver.
     fusion_test::GuardedMatrix<int8_t> c8(test.m, test.n, ldc8, 85);
     const int32_t offset = 0;
     size_t passed = 0;
     for (unsigned mode : options.modes) {
         for (int repeat = 0; repeat < options.repeat; ++repeat) {
-            // beta=0 must overwrite C, independent of its previous contents.
-            c32.reset(repeat % 2 == 0 ? 0 : 0x12345678);
             c8.reset(repeat % 2 == 0 ? -91 : 91);
             cblas_gemm_s8s8s32(CblasColMajor, CblasNoTrans, CblasNoTrans, CblasFixOffset,
                 test.m, test.n, kK, 1.0f, a.data(), lda, 0, b.data(), ldb, 0, 0.0f,
-                c32.data(), ldc, &offset, sa, sb, c8.data(), static_cast<size_t>(ldc8), mode);
+                nullptr, 0, &offset, sa, sb, c8.data(), static_cast<size_t>(ldc8), mode);
             const std::string context = " mode=" + std::to_string(mode) +
                                         " repeat=" + std::to_string(repeat);
-            c32.check_guards("C32" + context);
             c8.check_guards("C8" + context);
             for (const ReferenceProbe& probe : probes) {
-                const int32_t actual32 =
-                    c32.data()[static_cast<size_t>(probe.col) * ldc + probe.row];
-                if (actual32 != probe.expected) {
-                    throw std::runtime_error("C32 probe mismatch" + context +
+                const int expected8 = fusion_test::inverse_integer(probe.expected, mode);
+                const int legacy8 = fusion_test::inverse_fp64(probe.expected, mode);
+                const int actual8 = c8.data()[static_cast<size_t>(probe.col) * ldc8 + probe.row];
+                if (actual8 != expected8 || legacy8 != expected8) {
+                    throw std::runtime_error("C8 probe mismatch" + context +
                         " row=" + std::to_string(probe.row) + " col=" +
-                        std::to_string(probe.col) + " C32=" +
-                        std::to_string(actual32) + " expected32=" +
-                        std::to_string(probe.expected));
-                }
-            }
-            for (int j = 0; j < test.n; ++j) {
-                for (int i = 0; i < test.m; ++i) {
-                    const int32_t actual32 = c32.data()[static_cast<size_t>(j) * ldc + i];
-                    const int expected8 = fusion_test::inverse_integer(actual32, mode);
-                    const int legacy8 = fusion_test::inverse_fp64(actual32, mode);
-                    const int actual8 = c8.data()[static_cast<size_t>(j) * ldc8 + i];
-                    if (actual8 != expected8 || legacy8 != expected8) {
-                        throw std::runtime_error("output mismatch" + context + " row=" +
-                            std::to_string(i) + " col=" + std::to_string(j) + " C32=" +
-                            std::to_string(actual32) +
-                            " C8=" + std::to_string(actual8) + " integer8=" + std::to_string(expected8) +
-                            " fp64_legacy8=" + std::to_string(legacy8));
-                    }
+                        std::to_string(probe.col) + " expected32=" +
+                        std::to_string(probe.expected) + " C8=" +
+                        std::to_string(actual8) + " integer8=" +
+                        std::to_string(expected8) + " fp64_legacy8=" +
+                        std::to_string(legacy8));
                 }
             }
             if (a != original_a || b != original_b) throw std::runtime_error("input modified" + context);
@@ -348,8 +335,7 @@ size_t run_case(const Case& test, const Options& options, int8_t* sa, int8_t* sb
         }
     }
     std::cout << "PASS " << passed
-              << " calls; C8 inverse relation exhaustive, C32 independent probes, "
-                 "output guards and inputs exact.\n";
+              << " calls; C8 direct-store probes, output guards and inputs exact.\n";
     return passed;
 }
 }  // namespace

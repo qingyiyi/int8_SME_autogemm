@@ -1,3 +1,3 @@
-/* Production NN symbol: GEMM C32 store followed by the INT8 epilogue. */
+/* Production NN symbol: GEMM ZA accumulation followed by direct INT8 store. */
 #define INT8_INVERSE_SCALING_EPILOGUE
 #include "gemm_sme_nt.S"
