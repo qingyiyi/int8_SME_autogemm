@@ -55,6 +55,13 @@ TARGET      := libint8gemm.so
 TEST_SRC    := test_int8gemm_kblas.cpp
 TEST_OBJ    := $(TEST_SRC:%.cpp=%.o)
 TEST_TARGET := test_kblas_gemm
+PERF_SRC    := test_fused_performance.cpp
+PERF_OBJ    := $(PERF_SRC:%.cpp=%.o)
+PERF_TARGET := test_fused_gemm
+# test_fused_performance.cpp calls hbw_verify_memory_region(), whose public
+# hbwmalloc API is provided by libmemkind on the target image.  Keep this
+# overrideable in case the target installs it under a non-default path/name.
+PERF_LDLIBS ?= -lnuma -lhwloc -lmemkind
 
 # Portable reference checks never use target-only ARCH_FLAGS or target
 # dependencies.  They compile the production C++ driver against strict mocks.
@@ -76,7 +83,7 @@ LARGE_TEST_ARGS ?= --m 8192 --n 8192 --threads 32 --modes 0,1,19 --repeat 1 --se
 # 编译规则
 # ============================================
 
-.PHONY: all clean check test test-host test-driver-host verify verify-large
+.PHONY: all clean check test test-host test-driver-host perf verify verify-large verify-perf
 
 all: $(TARGET)
 
@@ -90,15 +97,26 @@ $(TARGET): $(BASE_OBJS)
 # Target executable: build only; `verify` runs it.
 test: $(TEST_TARGET)
 
+# HBM performance executable; unlike test_kblas_gemm this target emphasizes
+# timing/efficiency and follows the original int8/test_unigemm methodology.
+perf: $(PERF_TARGET)
+
 $(TEST_TARGET): $(TEST_OBJ) $(BASE_OBJS)
 	$(CXX) $(OPENMP) -o $@ $^ -lm -lpthread
 	@echo ">>> 生成生产测试程序: $@"
+
+$(PERF_TARGET): $(PERF_OBJ) $(BASE_OBJS)
+	$(CXX) $(OPENMP) -o $@ $^ -lm -lpthread $(PERF_LDLIBS)
+	@echo ">>> 生成 fused 性能测试程序: $@"
 
 verify: $(TEST_TARGET)
 	./$(TEST_TARGET) $(TEST_ARGS)
 
 verify-large: $(TEST_TARGET)
 	./$(TEST_TARGET) $(LARGE_TEST_ARGS)
+
+verify-perf: $(PERF_TARGET)
+	./$(PERF_TARGET) 8192 8192 2048 32 0,1,19 1 1
 
 test-host: $(HOST_TEST) $(PRODUCTION_DRIVER_TEST)
 	./$(HOST_TEST)
@@ -120,6 +138,9 @@ $(PRODUCTION_DRIVER_TEST): tests/test_production_driver_host.cpp int8_gemm.cpp $
 # Keep the test oracle strict even if production flags change later.
 $(TEST_OBJ): $(TEST_SRC) $(TEST_HEADERS) int8_gemm.hpp
 	$(CXX) $(ALL_CFLAGS) -std=c++17 $(REFERENCE_FP_FLAGS) -c $< -o $@
+
+$(PERF_OBJ): $(PERF_SRC) int8_gemm.hpp
+	$(CXX) $(ALL_CFLAGS) -std=c++17 -c $< -o $@
 
 # C++ implementation.
 int8_gemm.o: int8_gemm.cpp int8_gemm.hpp
@@ -153,7 +174,7 @@ assemble/gemm_sme_nt.o: assemble/gemm_sme_nt.S $(SME_ASM_DEPS)
 
 clean:
 	rm -f $(BASE_CPP_OBJS) $(BASE_ASM_OBJS) \
-	       $(TARGET) $(TEST_OBJ) $(TEST_TARGET) \
+	       $(TARGET) $(TEST_OBJ) $(TEST_TARGET) $(PERF_OBJ) $(PERF_TARGET) \
 	       $(HOST_TEST) $(PRODUCTION_DRIVER_TEST)
 # 快速检查
 check: $(TARGET)
