@@ -58,6 +58,14 @@ TEST_TARGET := test_kblas_gemm
 PERF_SRC    := test_fused_performance.cpp
 PERF_OBJ    := $(PERF_SRC:%.cpp=%.o)
 PERF_TARGET := test_fused_gemm
+
+# Local runtime libraries used only by the HBM performance test.  -L chooses
+# this project's lib/libhwloc.so at link time; the relative rpath lets the
+# executable find the same library at runtime without LD_LIBRARY_PATH.
+PROJECT_DIR     := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+PROJECT_LIB_DIR := $(PROJECT_DIR)/lib
+PERF_LDFLAGS ?= -L$(PROJECT_LIB_DIR) -Wl,-rpath,'$$ORIGIN/lib'
+
 # test_fused_performance.cpp calls hbw_verify_memory_region(), whose public
 # hbwmalloc API is provided by libmemkind on the target image.  Keep this
 # overrideable in case the target installs it under a non-default path/name.
@@ -106,7 +114,7 @@ $(TEST_TARGET): $(TEST_OBJ) $(BASE_OBJS)
 	@echo ">>> 生成生产测试程序: $@"
 
 $(PERF_TARGET): $(PERF_OBJ) $(BASE_OBJS)
-	$(CXX) $(OPENMP) -o $@ $^ -lm -lpthread $(PERF_LDLIBS)
+	$(CXX) $(OPENMP) -o $@ $^ -lm -lpthread $(PERF_LDFLAGS) $(PERF_LDLIBS)
 	@echo ">>> 生成 fused 性能测试程序: $@"
 
 verify: $(TEST_TARGET)
