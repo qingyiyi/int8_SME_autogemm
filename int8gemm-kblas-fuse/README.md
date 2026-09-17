@@ -128,7 +128,9 @@ make -B perf
 ```
 
 `mode 0` 是 low-byte 路径，跳过 reciprocal setup；`mode 1..19` 使用最终的
-SQDMULH fixed-reciprocal epilogue。
+SQDMULH fixed-reciprocal epilogue。最后一个参数 `3` 是**每个 mode 的 untimed
+warmup 次数**；它会在该 mode 的统计前完整执行 GEMM，但不计入 `fused_time`。默认值
+也是 3，只有需要故意观察冷启动时才应显式传入 `0`。
 
 正确性测试只分配最终 C8，并检查 C8 padding/guard 和 A/B 输入不被修改；生产路径
 不会分配或检查 C32。测试在确定性的 2048 block 边界、128 行/32 列 kernel 边界和

@@ -86,7 +86,8 @@ void print_usage(const char* program) {
         << "  threads: 1 or 32 (default 32)\n"
         << "  modes: 0..19, comma separated, or all (default 0,1,19)\n"
         << "  repeat: timed calls per mode (default 1)\n"
-        << "  warmup: untimed calls per mode (default 0)\n"
+        << "  warmup: untimed full GEMM calls per mode (default 3)\n"
+        << "          warmup is excluded from timing; use 0 only for cold-start tests\n"
         << "\nExamples:\n"
         << "  " << program << " 2048 2048 2048 32 0,1,19 3 1\n"
         << "  " << program << " 8192 8192 2048 32 0,1,19 3 1\n";
@@ -99,7 +100,10 @@ struct Options {
     int threads = 32;
     std::vector<unsigned> modes = {0, 1, 19};
     int repeat = 1;
-    int warmup = 0;
+    // A benchmark must not time the first full GEMM call: it can include
+    // one-time OpenMP/kernel/HBM activation.  This is per selected mode so
+    // mode 0 cannot make the first nonzero inverse-scaling mode look cold.
+    int warmup = 3;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -256,6 +260,30 @@ void check_omp_team(int requested_threads) {
     }
 }
 
+void invoke_fused_gemm(const Options& options, unsigned mode,
+                       int8_t* a, int8_t* b, int8_t* c8,
+                       int8_t* sa, int8_t* sb,
+                       int lda, int ldb, int ldc8) {
+    cblas_gemm_s8s8s8(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                      options.m, options.n, options.k, 1.0f,
+                      a, lda, 0, b, ldb, 0, 0.0f,
+                      sa, sb, c8, static_cast<size_t>(ldc8), mode);
+}
+
+void warmup_mode(const Options& options, unsigned mode,
+                 int8_t* a, int8_t* b, int8_t* c8,
+                 int8_t* sa, int8_t* sb,
+                 int lda, int ldb, int ldc8) {
+    const size_t c8_bytes = static_cast<size_t>(ldc8) * options.n;
+    for (int i = 0; i < options.warmup; ++i) {
+        // Match the timed-call setup, but keep both the reset and the GEMM
+        // outside the measured region.  This pre-touches C8 and exercises the
+        // exact selected inverse-scaling path before its first timed sample.
+        std::memset(c8, 0, c8_bytes);
+        invoke_fused_gemm(options, mode, a, b, c8, sa, sb, lda, ldb, ldc8);
+    }
+}
+
 double run_mode(const Options& options, unsigned mode,
                 int8_t* a, int8_t* b, int8_t* c8,
                 int8_t* sa, int8_t* sb,
@@ -263,24 +291,20 @@ double run_mode(const Options& options, unsigned mode,
     nthreadsM = options.threads;
     nthreadsN = 1;
 
-    for (int i = 0; i < options.warmup; ++i) {
-        cblas_gemm_s8s8s8(CblasColMajor, CblasNoTrans, CblasNoTrans,
-                          options.m, options.n, options.k, 1.0f,
-                          a, lda, 0, b, ldb, 0, 0.0f,
-                          sa, sb, c8, static_cast<size_t>(ldc8), mode);
-    }
+    // Every selected mode gets its own warmup.  In particular, a mode list
+    // such as "0,1,19" no longer lets mode 0 absorb process/kernel startup and
+    // then reports mode 1 as the first cold reciprocal measurement.
+    warmup_mode(options, mode, a, b, c8, sa, sb, lda, ldb, ldc8);
 
+    const size_t c8_bytes = static_cast<size_t>(ldc8) * options.n;
     double total_seconds = 0.0;
     for (int i = 0; i < options.repeat; ++i) {
         // Do not include output initialization in the GEMM timing, matching
         // int8/test_unigemm.cpp.  The fused kernel overwrites every valid C8
         // element on each call.
-        std::memset(c8, 0, static_cast<size_t>(ldc8) * options.n);
+        std::memset(c8, 0, c8_bytes);
         const auto start = std::chrono::high_resolution_clock::now();
-        cblas_gemm_s8s8s8(CblasColMajor, CblasNoTrans, CblasNoTrans,
-                          options.m, options.n, options.k, 1.0f,
-                          a, lda, 0, b, ldb, 0, 0.0f,
-                          sa, sb, c8, static_cast<size_t>(ldc8), mode);
+        invoke_fused_gemm(options, mode, a, b, c8, sa, sb, lda, ldb, ldc8);
         const auto end = std::chrono::high_resolution_clock::now();
         const std::chrono::duration<double> elapsed = end - start;
         total_seconds += elapsed.count();
@@ -334,7 +358,8 @@ int main(int argc, char** argv) {
                   << " threads=" << options.threads
                   << " modes=" << modes_to_string(options.modes)
                   << " repeat=" << options.repeat
-                  << " warmup=" << options.warmup << "\n"
+                  << " warmup_per_mode=" << options.warmup
+                  << " (excluded from timing)\n"
                   << "A=" << a_bytes << " B=" << b_bytes << " C8=" << c8_bytes
                   << " scratchA=" << kSaBytes << " scratchB=" << kSbBytes << "\n";
 
