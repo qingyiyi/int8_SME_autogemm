@@ -41,12 +41,18 @@ cblas_gemm_s8s8s8(..., sa, sb, c8, ldc8, num_moduli)
 
 inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生产
 `assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编在每个 ZA
-结果向量刚被 `MOVA` 取出后，使用 signed integer division (`sdiv`)、余数重构
-(`mls`) 和 centered-remainder 修正；这与 19 个正奇数模数下的原 FP64 语义一致。
-`modulus=0` 路径直接写该 INT32 向量的低字节。
+结果向量刚被 `MOVA` 取出后完成 inverse scaling，再用原有的 `UZP1 × 2 + ST1B`
+直接写 C8；`modulus=0` 路径直接写该 INT32 向量的低字节。
 
-没有独立的 fused C++ API、fused kernel 符号、shadow driver 或阶段性 fallback。
-原有的 GEMM 累加和 packing 代码保持不变。
+非零 modulus 的 quotient 固定使用已验证的 reciprocal 实现：driver 为每个
+mode 传入 `floor(2^32 / modulus)`，汇编右移得到 `floor(2^31 / modulus)`，再以
+`SQDMULH + MLS + 两个单步余数归一化` 得到精确余数，最后转换为 centered remainder。
+这条路径不使用 `SDIV`、FP32/FP64 或饱和窄化；`modulus=0` 仍跳过 reciprocal setup，
+直接保留 INT32 的低字节。
+
+该实现仅改变 `MOVA ZA.S -> Z.S` 后的 inverse-scaling epilogue。MOPA、ZA
+accumulation、packing、tile traversal、C8 地址映射和最终 `UZP1 × 2 + ST1B`
+low-byte/wrap store 均保持不变；没有 `SDIV` fallback 或临时构建开关。
 
 ### 汇编 ABI
 
@@ -56,7 +62,7 @@ inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生�
 |---:|---|---|
 | 0 | `c8` | 当前 C8 tile 首地址 |
 | 8 | `modulus` | 0 或选中的正奇数模数 |
-| 12 | `reciprocal_magic` | `floor(2^32 / modulus)`；mode 0 为 0（当前 SDIV 阶段尚未读取） |
+| 12 | `reciprocal_magic` | `floor(2^32 / modulus)`；mode 0 为 0；magic epilogue 用其右移一位得到 `floor(2^31 / modulus)` |
 
 结构体总大小为 16 bytes。生产 driver 为每个 NN tile 创建该参数块，并把当前
 C8 tile 首地址和 `ldc8` 传给 kernel 的两个输出槽。原 kernel 的输出遍历仍按
@@ -77,7 +83,7 @@ make -B test-host
 
 该命令验证：
 
-- FP64 reference、整数 centered-remainder oracle、所有 19 个模数和低字节路径；
+- FP64 reference、整数 centered-remainder oracle、最终 SQDMULH fixed-reciprocal model、所有 19 个模数和低字节路径；
 - INT32 累加器边界、guard/padding 和固定 K=2048 的标量参考；
 - 生产 C++ driver 的 C8 tile 地址、C8 stride、modulus 传递和 1/32 线程分块；
 - 虚拟四字节 word 坐标到 C8 字节地址的 `>> 2` 转换：覆盖 2048/8192、非 4 字节对齐的
@@ -88,55 +94,55 @@ host 测试不具备 AArch64 SME 指令执行能力，所以不能替代目标�
 
 ## ARM SME 目标机验证
 
-目标机上必须强制重建，确保 `gemm_sme_inverse_scaling.S` 被重新包含：
+本机不能编译或执行 AArch64 SME 汇编；只以目标业务尺寸
+`8192 × 8192 × 2048`、32 threads、all modes 验收。
+
+### 1. 正确性：8192、全 mode
 
 ```bash
 cd /rjs/cxz/huawei/int8gemm-kblas-fuse
 make clean
 make -B test
-make -B test-driver-host
-make check
+
+export OMP_PROC_BIND=close
+export OMP_PLACES=cores
+
+./test_kblas_gemm \
+  --m 8192 --n 8192 --threads 32 \
+  --modes all --repeat 1 --seed 42
 ```
 
-先跑 2048 基准尺寸，再跑用户重点尺寸：
-
-```bash
-./test_kblas_gemm --m 2048 --n 2048 --threads 1  --repeat 1 --seed 42
-./test_kblas_gemm --m 2048 --n 2048 --threads 32 --repeat 1 --seed 42
-./test_kblas_gemm --m 8192 --n 8192 --threads 32 --modes 0,1,19 --repeat 1 --seed 42
-```
-
-也可以使用 Makefile 封装的命令：
-
-```bash
-make verify
-make verify-large
-```
-
-2048 验证默认覆盖 `num_moduli=0..19`；`make verify-large` 默认在 8192 重点尺寸
-覆盖低字节路径和模数表两端（`--modes 0,1,19`），需要全模数回归时可显式传
-`--modes all`。测试只分配最终 C8，并检查 C8 的 padding/guard 以及 A/B 输入不被
-修改；不会分配或检查生产 C32。由于业务最小尺寸已经是 `2048 × 2048`，测试不会
-尝试构造不可用的 `M × N × K` 标量 reference；它会在每个 2048 块边界、128 行/32
-列 kernel 边界和确定性的内部坐标上运行独立的 INT32 标量累加器 reference，再用
-独立 inverse-scaling oracle 验证直接写入的 C8；该 reference 不会构造 C32
-输出矩阵。GEMM 累加路径仍以已验证的原始实现为准。自定义 `--m/--n` 必须是正的 2048 倍数，最大为 8192；32 线程路径
-还要求 `N` 能被 32 整除。
-
-目标机成功时应看到类似：
+也可以直接执行 `make verify`；它的默认参数就是上面的固定生产合同。预期是 20 个
+mode 全部通过，类似：
 
 ```text
-PRODUCTION PASS: ... business-shape cases; K=2048, modes=....
+PASS 20 calls; C8 direct-store probes, output guards and inputs exact.
 ```
 
-若失败，请保留完整的第一条 `RUN ...` 和 `PRODUCTION FAIL: ...` 输出，以及
-编译器报告的第一处汇编/链接错误。优先检查：
+### 2. 性能采样：8192、全 mode
 
-- 是否执行了 `make clean && make -B test`；
-- `nm test_kblas_gemm | grep int8_sme_gemm_kernel_nn` 是否存在生产 NN 符号；
-- SVE VL/SME SVL 是否均为 64 bytes；
-- OpenMP 是否确实创建了 1 或 32 个线程；
-- 进程是否保持 `FE_TONEAREST`。
+```bash
+make clean
+make -B perf
+./test_fused_gemm 8192 8192 2048 32 all 10 3
+```
+
+`mode 0` 是 low-byte 路径，跳过 reciprocal setup；`mode 1..19` 使用最终的
+SQDMULH fixed-reciprocal epilogue。
+
+正确性测试只分配最终 C8，并检查 C8 padding/guard 和 A/B 输入不被修改；生产路径
+不会分配或检查 C32。测试在确定性的 2048 block 边界、128 行/32 列 kernel 边界和
+内部坐标处运行独立 INT32 标量 accumulator reference，再以独立的 integer、FP64 和
+SQDMULH fixed-reciprocal oracle 验证 C8。
+
+若失败，请保留完整的第一条 `RUN ...`、`PRODUCTION FAIL: ...`，以及编译器报告的
+第一处汇编/链接错误。优先确认：
+
+- 执行的是 `make clean && make -B test`；
+- `nm test_kblas_gemm | grep int8_sme_gemm_kernel_nn` 存在生产 NN 符号；
+- SVE VL/SME SVL 均为 64 bytes；
+- OpenMP 确实创建 32 个线程；
+- 进程保持 `FE_TONEAREST`。
 
 ## 文件说明
 

@@ -38,6 +38,18 @@ constexpr bool reciprocal_magic_is_exact() {
 static_assert(reciprocal_magic_is_exact(),
               "frozen reciprocal table must equal floor(2^32 / p)");
 
+constexpr bool reciprocal_qdmulh_magic_is_exact() {
+    for (size_t i = 0; i < kModuli.size(); ++i) {
+        if ((kReciprocalMagic[i] >> 1) !=
+            (UINT64_C(1) << 31) / static_cast<uint32_t>(kModuli[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(reciprocal_qdmulh_magic_is_exact(),
+              "SQDMULH magic must equal floor(2^31 / p)");
+
 inline int8_t low_byte(int32_t value) {
     const int byte = static_cast<uint32_t>(value) & 255u;
     // Avoid implementation-defined out-of-range signed narrowing in the oracle.
@@ -77,47 +89,36 @@ inline int8_t inverse_integer(int32_t value, unsigned mode) {
     return static_cast<int8_t>(remainder);
 }
 
-// Host model of the production scalar inverse-scaling epilogue.  It deliberately
-// follows `sdiv` + `msub` and the two signed correction branches rather than
-// using `%`, so this test catches a future change in the assembly algorithm.
-inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
-    check_mode(mode);
-    if (mode == 0) return low_byte(value);
-    const int32_t p = kModuli[mode - 1];
-    const int32_t half = p >> 1;
-    const int32_t quotient = value / p;  // AArch64 SDIV truncates toward zero.
-    int32_t remainder = value - quotient * p;  // AArch64 MSUB result.
-    if (remainder > half) {
-        remainder -= p;
-    } else if (remainder + half < 0) {
-        remainder += p;
-    }
-    return static_cast<int8_t>(remainder);
+// Exact host model of the final SVE2/SME SQDMULH production path.  SQDMULH
+// returns the arithmetic high half of twice the signed product, i.e.
+// floor(value * floor(2^31/p) / 2^31) here.  The explicit signed floor helper
+// keeps this model independent of implementation-defined right shifts.
+inline int64_t signed_floor_divide_2_to_32(int64_t numerator) {
+    constexpr int64_t denominator = INT64_C(1) << 32;
+    if (numerator >= 0) return numerator / denominator;
+    // The input range below is far from INT64_MIN, so negation is safe.
+    return -((-numerator + denominator - 1) / denominator);
 }
 
-// Host model of the proposed division-free epilogue.  For B=2^32 and
-// magic=floor(B/p), high32(abs(value)*magic) never overestimates abs(value)/p.
-// For every signed INT32 magnitude its error is less than one quotient, so one
-// `remainder >= p` correction recovers the exact non-negative remainder.
-inline int8_t inverse_magic_scalar_model(int32_t value, unsigned mode) {
+inline int8_t inverse_fused_magic_scalar_model(int32_t value, unsigned mode) {
     check_mode(mode);
     if (mode == 0) return low_byte(value);
 
-    const uint32_t p = static_cast<uint32_t>(kModuli[mode - 1]);
-    const uint64_t magnitude = value < 0
-        ? static_cast<uint64_t>(-static_cast<int64_t>(value))
-        : static_cast<uint64_t>(value);
-    const uint64_t quotient =
-        (magnitude * static_cast<uint64_t>(kReciprocalMagic[mode - 1])) >> 32;
-    uint64_t remainder = magnitude - quotient * p;
-    if (remainder >= p) remainder -= p;
+    const int64_t p = static_cast<int64_t>(kModuli[mode - 1]);
+    const int64_t magic31 =
+        static_cast<int64_t>(kReciprocalMagic[mode - 1] >> 1);
+    // No saturation is possible: |2 * INT32_MIN * magic31| < 2^63 and the
+    // resulting quotient is far inside INT32's signed range.
+    const int64_t quotient = signed_floor_divide_2_to_32(
+        INT64_C(2) * static_cast<int64_t>(value) * magic31);
+    int64_t remainder = static_cast<int64_t>(value) - quotient * p;
 
-    int32_t centered = static_cast<int32_t>(remainder);
-    if (centered > static_cast<int32_t>(p >> 1)) {
-        centered -= static_cast<int32_t>(p);
-    }
-    if (value < 0) centered = -centered;
-    return static_cast<int8_t>(centered);
+    // q0 is at most one away from floor(value/p).  These are exactly the two
+    // predicated normalizations in the assembly before centering the remainder.
+    if (remainder < 0) remainder += p;
+    if (remainder >= p) remainder -= p;
+    if (remainder > p / 2) remainder -= p;
+    return static_cast<int8_t>(remainder);
 }
 
 // One independently computed element of a column-major NN GEMM.  The target

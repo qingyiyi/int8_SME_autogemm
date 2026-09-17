@@ -40,8 +40,7 @@ ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(DEFINES) $(OPENMP) $(INCLUDES)
 # The production NN symbol includes the inverse-scaling epilogue.  There is
 # intentionally only one driver/kernel path in the final build.
 BASE_CPP_SRCS := int8_gemm.cpp
-BASE_ASM_SRCS := assemble/gemm_sme_nt.S \
-                 assemble/gemm_sme_nn.S \
+BASE_ASM_SRCS := assemble/gemm_sme_nn.S \
                  assemble/gemm_tcopy_zip.S \
                  assemble/gemm_ncopy_unzip.S
 
@@ -82,16 +81,14 @@ HOST_DRIVER_HEADERS   := tests/reference.hpp int8_gemm.hpp \
                         tests/host_stubs/numaif.h
 TEST_HEADERS          := tests/reference.hpp tests/guarded_matrix.hpp
 REFERENCE_FP_FLAGS   := -fno-fast-math -frounding-math -ffp-contract=off
-# Default target acceptance is a supported business shape.  Use the explicit
-# 8192 target below for the large production run.
-TEST_ARGS ?= --m 2048 --n 2048 --threads 32 --repeat 1 --seed 42
-LARGE_TEST_ARGS ?= --m 8192 --n 8192 --threads 32 --modes 0,1,19 --repeat 1 --seed 42
+# The only target acceptance shape is the fixed production contract.
+TEST_ARGS ?= --m 8192 --n 8192 --threads 32 --modes all --repeat 1 --seed 42
 
 # ============================================
 # 编译规则
 # ============================================
 
-.PHONY: all clean check test test-host test-driver-host perf verify verify-large verify-perf
+.PHONY: all clean check test test-host test-driver-host perf verify verify-perf
 
 all: $(TARGET)
 
@@ -120,11 +117,8 @@ $(PERF_TARGET): $(PERF_OBJ) $(BASE_OBJS)
 verify: $(TEST_TARGET)
 	./$(TEST_TARGET) $(TEST_ARGS)
 
-verify-large: $(TEST_TARGET)
-	./$(TEST_TARGET) $(LARGE_TEST_ARGS)
-
 verify-perf: $(PERF_TARGET)
-	./$(PERF_TARGET) 8192 8192 2048 32 0,1,19 1 1
+	./$(PERF_TARGET) 8192 8192 2048 32 all 1 1
 
 test-host: $(HOST_TEST) $(PRODUCTION_DRIVER_TEST)
 	./$(HOST_TEST)
@@ -175,10 +169,6 @@ assemble/gemm_ncopy_unzip.o: assemble/gemm_ncopy_unzip.S
 # NN kernel -> int8_sme_gemm_kernel_nn, including the production epilogue.
 assemble/gemm_sme_nn.o: assemble/gemm_sme_nn.S $(NN_ASM_DEPS)
 	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nn -DASMFNAME=int8_sme_gemm_kernel_nn_ -DNAME=int8_sme_gemm_kernel_nn_ -DCNAME=int8_sme_gemm_kernel_nn -c $< -o $@
-
-# NT kernel -> int8_sme_gemm_kernel_nt (kept as the original non-fused symbol).
-assemble/gemm_sme_nt.o: assemble/gemm_sme_nt.S $(SME_ASM_DEPS)
-	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nt -DASMFNAME=int8_sme_gemm_kernel_nt_ -DNAME=int8_sme_gemm_kernel_nt_ -DCNAME=int8_sme_gemm_kernel_nt -c $< -o $@
 
 clean:
 	rm -f $(BASE_CPP_OBJS) $(BASE_ASM_OBJS) \

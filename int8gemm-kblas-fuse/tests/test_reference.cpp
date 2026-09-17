@@ -55,14 +55,13 @@ int main() {
         const auto check = [&](int32_t value, unsigned mode) {
             const int actual = fusion_test::inverse_fp64(value, mode);
             const int expected = fusion_test::inverse_integer(value, mode);
-            const int fused_scalar = fusion_test::inverse_fused_scalar_model(value, mode);
-            const int magic_scalar = fusion_test::inverse_magic_scalar_model(value, mode);
-            require(actual == expected && fused_scalar == expected && magic_scalar == expected,
+            const int fused_magic =
+                fusion_test::inverse_fused_magic_scalar_model(value, mode);
+            require(actual == expected && fused_magic == expected,
                     "inverse mismatch: C=" + std::to_string(value) +
                     " mode=" + std::to_string(mode) + " fp64=" + std::to_string(actual) +
                     " integer=" + std::to_string(expected) +
-                    " fused_scalar=" + std::to_string(fused_scalar) +
-                    " magic_scalar=" + std::to_string(magic_scalar));
+                    " fused_magic=" + std::to_string(fused_magic));
             ++checked;
         };
         std::mt19937 rng(20260910);
@@ -113,7 +112,7 @@ int main() {
         test_guards();
         test_accumulator_oracle();
         std::cout << "PASS host reference: " << checked
-                  << " inverse cases including the division-free magic model; guard fault "
+                  << " inverse cases including the final SQDMULH fixed-reciprocal model; guard fault "
                      "injection; fixed-K accumulator oracle.\n"
                   << "This is NOT an SME kernel acceptance test.\n";
         return 0;

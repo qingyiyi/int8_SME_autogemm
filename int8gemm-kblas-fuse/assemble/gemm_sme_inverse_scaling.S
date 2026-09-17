@@ -6,7 +6,7 @@
  * vector and writes INT8 immediately, without materializing a C32 tile.
  *
  * Int8FusedStoreParams layout (bytes):
- *   0  c8       8  modulus       12 reciprocal_magic (unused by SDIV stage)
+ *   0  c8       8  modulus       12 reciprocal_magic
  */
 
 #define INVERSE_SCALING_PARAMS_C8                0
@@ -29,6 +29,21 @@
  * This is the same integer form used by the validated scalar epilogue and is
  * equivalent to the old FP64 rint/fma result for the supported odd moduli.
  *
+ * The quotient uses an exact fixed-reciprocal sequence.  The ABI carries
+ * m32=floor(2^32/p); this helper derives m31=m32>>1=floor(2^31/p), then
+ * computes:
+ *
+ *     q0 = SQDMULH(value, m31) = floor(value*m31 / 2^31)
+ *     r  = value - q0*p
+ *     if (r < 0)  r += p
+ *     if (r >= p) r -= p
+ *
+ * For every supported p and signed INT32 input, q0 differs from floor(value/p)
+ * by at most one.  The two one-step normalizations therefore recover the exact
+ * [0,p) remainder before the final centered-remainder correction.  SQDMULH is
+ * non-saturating for this operand range (and for the fixed K=2048 accumulator
+ * bound), so no FP32/FP64 conversion or division is involved.
+ *
  * In the fused NN build, the existing kernel C/ldc argument slots are kept as
  * a virtual INT32 coordinate plane so the proven GEMM traversal is unchanged.
  * The numeric base is the same as `c8`; the virtual plane is never dereferenced.
@@ -38,11 +53,37 @@
  * x4/x5/x6 are dead after GEMM reaches SAVE_ZACOL.  p5/p6 are temporary
  * predicates: MOPA predicates for the just-finished M block, rebuilt before a
  * later M block can accumulate.  The live p0-p4/p7 traversal predicates and the
- * p1/p2 MOVA predicates are left intact.  SAVE_ZACOL passes two scratch Z
- * registers (`tmp_q` and `tmp_mod`) which are disjoint from the current value
- * register in every existing save-register schedule.
+ * p1/p2 MOVA predicates are left intact.  SAVE_ZACOL passes one quotient
+ * scratch Z register (`tmp_q`) which is disjoint from the current value
+ * register in every existing INT8 save-register schedule.
+ *
+ * The fixed reciprocal constants are invariant for one kernel invocation.  The
+ * save entry below constructs them once per completed ZA result tile in
+ * z27/z28/z29.  Those registers are dead throughout every current save schedule
+ * and are overwritten again before the following accumulation tile.  Keeping
+ * this setup outside the per-vector helper removes repeated parameter loads,
+ * shifts and DUPs without changing the value/address/predicate path below.
  */
-.macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q,tmp_mod
+.macro INT8_INVERSE_SCALING_PREPARE
+    // The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176.
+    ldr     x4, [sp, #(11 * 16 + 8)]
+    cbz     x4, 9f
+
+    ldr     w5, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
+    // Mode 0 takes the direct helper's original low-byte fast path, so do not
+    // construct reciprocal vectors for it.
+    cbz     w5, 9f
+
+    ldr     w6, [x4, #INVERSE_SCALING_PARAMS_RECIPROCAL_MAGIC]
+    lsr     w6, w6, #1                  // floor(2^31 / p)
+    dup     z27.s, w6                   // magic31
+    dup     z28.s, w5                   // modulus
+    lsr     w5, w5, #1                  // floor(p/2), p is odd
+    dup     z29.s, w5                   // half modulus
+9:
+.endm
+
+.macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q
     // The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176.
     ldr     x4, [sp, #(11 * 16 + 8)]
     cbz     x4, 9f
@@ -68,27 +109,27 @@
     cntp    x5, \reg_pg, \reg_pg\().s
     whilelt p6.b, xzr, x5
 
-    // A zero modulus is the low-byte mode and must not execute SDIV.
+    // A zero modulus is the low-byte mode and must not enter the reciprocal
+    // path, so mode 0 retains its original fast epilogue cost.
     cbz     w6, 8f
 
-    // q = trunc(value / p), with SDIV's required destructive numerator.
-    dup     \tmp_mod\().s, w6
-    mov     \tmp_q\().d, \value\().d
-    sdiv    \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s, \tmp_mod\().s
+    // z27/z28/z29 were prepared once for this completed ZA tile.  The
+    // mode-0 branch remains before all inverse arithmetic, preserving its
+    // original low-byte fast path.
+    sqdmulh \tmp_q\().s, \value\().s, z27.s
 
-    // value <- value - q*p (MLS is the predicated destructive form).
-    mls     \value\().s, \reg_pg\()/M, \tmp_q\().s, \tmp_mod\().s
+    // r = value - q0*p.  q0 can be one quotient below/above floor(value/p),
+    // depending on the sign; normalize it to the unique unsigned remainder.
+    mls     \value\().s, \reg_pg\()/M, \tmp_q\().s, z28.s
+    cmplt   p5.s, \reg_pg\()/z, \value\().s, #0
+    add     \value\().s, p5/m, \value\().s, z28.s
+    cmpge   p5.s, \reg_pg\()/z, \value\().s, z28.s
+    sub     \value\().s, p5/m, \value\().s, z28.s
 
-    // Correct the signed remainder into the centered interval.
-    // x5 is no longer needed after WHILELT, so reuse it for floor(p/2).
-    lsr     w5, w6, #1                  // floor(p/2), p is odd
-    dup     \tmp_q\().s, w5
-    cmpgt   p5.s, \reg_pg\()/z, \value\().s, \tmp_q\().s
-    sub     \value\().s, p5/m, \value\().s, \tmp_mod\().s
-
-    neg     \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s
-    cmpgt   p5.s, \reg_pg\()/z, \tmp_q\().s, \value\().s
-    add     \value\().s, p5/m, \value\().s, \tmp_mod\().s
+    // r is now the exact [0,p) remainder, so only the positive centered-
+    // remainder correction is required.
+    cmpgt   p5.s, \reg_pg\()/z, \value\().s, z29.s
+    sub     \value\().s, p5/m, \value\().s, z28.s
 
 8:
     // Keep the low byte of each (possibly corrected) INT32 lane.
