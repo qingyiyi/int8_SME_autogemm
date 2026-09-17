@@ -16,6 +16,27 @@ constexpr std::array<int32_t, 19> kModuli = {
     255, 253, 251, 247, 241, 239, 233, 229, 227, 223,
     217, 211, 199, 197, 193, 191, 181, 179, 173
 };
+// Frozen independently of the production dispatch table.  Each entry is
+// floor(2^32 / p) for the modulus at the same index.
+constexpr std::array<uint32_t, 19> kReciprocalMagic = {
+    16843009u, 16976155u, 17111423u, 17388531u, 17821441u,
+    17970574u, 18433336u, 18755315u, 18920560u, 19259943u,
+    19792476u, 20355295u, 21582750u, 21801864u, 22253716u,
+    22486739u, 23729101u, 23994230u, 24826400u
+};
+constexpr int32_t kMaximumAccumulatorMagnitude = kFixedK * 128 * 128;
+
+constexpr bool reciprocal_magic_is_exact() {
+    for (size_t i = 0; i < kModuli.size(); ++i) {
+        if (kReciprocalMagic[i] !=
+            (UINT64_C(1) << 32) / static_cast<uint32_t>(kModuli[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(reciprocal_magic_is_exact(),
+              "frozen reciprocal table must equal floor(2^32 / p)");
 
 inline int8_t low_byte(int32_t value) {
     const int byte = static_cast<uint32_t>(value) & 255u;
@@ -72,6 +93,31 @@ inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
         remainder += p;
     }
     return static_cast<int8_t>(remainder);
+}
+
+// Host model of the proposed division-free epilogue.  For B=2^32 and
+// magic=floor(B/p), high32(abs(value)*magic) never overestimates abs(value)/p.
+// For every signed INT32 magnitude its error is less than one quotient, so one
+// `remainder >= p` correction recovers the exact non-negative remainder.
+inline int8_t inverse_magic_scalar_model(int32_t value, unsigned mode) {
+    check_mode(mode);
+    if (mode == 0) return low_byte(value);
+
+    const uint32_t p = static_cast<uint32_t>(kModuli[mode - 1]);
+    const uint64_t magnitude = value < 0
+        ? static_cast<uint64_t>(-static_cast<int64_t>(value))
+        : static_cast<uint64_t>(value);
+    const uint64_t quotient =
+        (magnitude * static_cast<uint64_t>(kReciprocalMagic[mode - 1])) >> 32;
+    uint64_t remainder = magnitude - quotient * p;
+    if (remainder >= p) remainder -= p;
+
+    int32_t centered = static_cast<int32_t>(remainder);
+    if (centered > static_cast<int32_t>(p >> 1)) {
+        centered -= static_cast<int32_t>(p);
+    }
+    if (value < 0) centered = -centered;
+    return static_cast<int8_t>(centered);
 }
 
 // One independently computed element of a column-major NN GEMM.  The target

@@ -241,9 +241,13 @@ extern "C" void int8_sme_gemm_kernel_nn(
     const int32_t expected_modulus = invocation != nullptr && invocation->mode != 0
         ? fusion_test::kModuli[invocation->mode - 1]
         : 0;
+    const uint32_t expected_magic = invocation != nullptr && invocation->mode != 0
+        ? fusion_test::kReciprocalMagic[invocation->mode - 1]
+        : 0u;
     if (invocation == nullptr || params == nullptr || k != kK || alpha != 1.0f ||
         params->c8 != c8 || ldc8 != kLdc8 ||
-        params->modulus != expected_modulus || rows <= 0 || cols <= 0 ||
+        params->modulus != expected_modulus ||
+        params->reciprocal_magic != expected_magic || rows <= 0 || cols <= 0 ||
         !tile_origin(params, &base_row, &base_col) || base_row + rows > kM ||
         base_col + cols > kN) {
         if (invocation != nullptr) invocation->invalid.store(true);
@@ -279,7 +283,7 @@ int main() {
         // marker would be overwritten and this call fails.
         run_one(1, 1, C8Behavior::Marker);
         std::cout << "PASS host production-driver mock: virtual word-to-C8 address "
-                     "mapping, C8-only API wiring, all moduli, C8 stride, padding, "
+                     "mapping, C8-only API wiring, all modulus/magic pairs, C8 stride, padding, "
                      "1/32-thread tiling, and absence of a post-kernel C++ "
                      "inverse-scaling pass verified.\n";
         return 0;

@@ -56,7 +56,7 @@ inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生�
 |---:|---|---|
 | 0 | `c8` | 当前 C8 tile 首地址 |
 | 8 | `modulus` | 0 或选中的正奇数模数 |
-| 12 | `reserved` | 保留 |
+| 12 | `reciprocal_magic` | `floor(2^32 / modulus)`；mode 0 为 0（当前 SDIV 阶段尚未读取） |
 
 结构体总大小为 16 bytes。生产 driver 为每个 NN tile 创建该参数块，并把当前
 C8 tile 首地址和 `ldc8` 传给 kernel 的两个输出槽。原 kernel 的输出遍历仍按

@@ -6,11 +6,12 @@
  * vector and writes INT8 immediately, without materializing a C32 tile.
  *
  * Int8FusedStoreParams layout (bytes):
- *   0  c8       8  modulus       12 reserved
+ *   0  c8       8  modulus       12 reciprocal_magic (unused by SDIV stage)
  */
 
-#define INVERSE_SCALING_PARAMS_C8       0
-#define INVERSE_SCALING_PARAMS_MODULUS  8
+#define INVERSE_SCALING_PARAMS_C8                0
+#define INVERSE_SCALING_PARAMS_MODULUS           8
+#define INVERSE_SCALING_PARAMS_RECIPROCAL_MAGIC 12
 
 /*
  * Apply inverse scaling to one INT32 vector which has just been read from ZA,

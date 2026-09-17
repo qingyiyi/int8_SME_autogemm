@@ -11,13 +11,36 @@
 int nthreadsM = 32;
 int nthreadsN = 1;
 
-// The assembly epilogue receives the selected modulus, not the mode index.
-// Keep this small dispatch table in the driver; all arithmetic remains in the
-// GEMM assembly.  The business contract uses num_moduli in [0, 19].
-constexpr int32_t INVERSE_SCALING_MODULI[19] = {
-        255, 253, 251, 247, 241, 239, 233, 229, 227, 223,
-        217, 211, 199, 197, 193, 191, 181, 179, 173,
+// The assembly epilogue receives fixed constants, not the mode index.  Keep
+// modulus and floor(2^32 / modulus) paired so a future table edit cannot select
+// a reciprocal belonging to another modulus.  Mode zero uses {0, 0} and keeps
+// the existing low-byte path.  The business contract uses num_moduli in [0, 19].
+struct InverseScalingConstants {
+    int32_t modulus;
+    uint32_t reciprocal_magic;
 };
+
+constexpr InverseScalingConstants INVERSE_SCALING_CONSTANTS[20] = {
+        {0, 0u},
+        {255, 16843009u}, {253, 16976155u}, {251, 17111423u},
+        {247, 17388531u}, {241, 17821441u}, {239, 17970574u},
+        {233, 18433336u}, {229, 18755315u}, {227, 18920560u},
+        {223, 19259943u}, {217, 19792476u}, {211, 20355295u},
+        {199, 21582750u}, {197, 21801864u}, {193, 22253716u},
+        {191, 22486739u}, {181, 23729101u}, {179, 23994230u},
+        {173, 24826400u},
+};
+
+constexpr bool inverse_scaling_constants_are_exact() {
+    for (size_t mode = 1; mode < 20; ++mode) {
+        const uint64_t expected = (UINT64_C(1) << 32) /
+                                  static_cast<uint32_t>(INVERSE_SCALING_CONSTANTS[mode].modulus);
+        if (INVERSE_SCALING_CONSTANTS[mode].reciprocal_magic != expected) return false;
+    }
+    return true;
+}
+static_assert(inverse_scaling_constants_are_exact(),
+              "inverse-scaling reciprocal table must equal floor(2^32 / p)");
 
 // This is deliberately private to the fused C8-only driver.  The old generic
 // BlasArgs/BlasQueue definitions carried legacy C/C32 fields that this path no
@@ -93,7 +116,7 @@ typedef struct {
 // P 是M维度， Q是K维度，R是N维度
 // WARNING: 可以改成256
 #define LEVEL3_GEMM_P 128
-static void SmeGemmDriver(const SmeGemmArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG mask, const BLASLONG *rangeM, const BLASLONG *rangeN, int8_t *c8, size_t ldc8, int32_t modulus)
+static void SmeGemmDriver(const SmeGemmArgs *args, FLOAT *sa, FLOAT *sb, BLASULONG mask, const BLASLONG *rangeM, const BLASLONG *rangeN, int8_t *c8, size_t ldc8, InverseScalingConstants scaling)
 {
     
     int thread_id = omp_get_thread_num();
@@ -185,7 +208,8 @@ static void SmeGemmDriver(const SmeGemmArgs *args, FLOAT *sa, FLOAT *sb, BLASULO
                         c8 + is + jj * static_cast<BLASLONG>(ldc8);
                     Int8FusedStoreParams store_params{};
                     store_params.c8 = c8_tile;
-                    store_params.modulus = modulus;
+                    store_params.modulus = scaling.modulus;
+                    store_params.reciprocal_magic = scaling.reciprocal_magic;
 
                     KERNEL_OPERATION_SME(minI, minJJ, minL, alpha, bufaa, lda,
                                          bufbb + nypos*minL*minJ + (jj - js) * minL,
@@ -245,14 +269,12 @@ void cblas_gemm_s8s8s8( const CBLAS_LAYOUT layout,
     memset(job_t, 0, nthreads * nthreads * sizeof(int*));
 
     newArgs.common = (void*)job_t;
-    const int32_t modulus = num_moduli == 0
-        ? 0
-        : INVERSE_SCALING_MODULI[num_moduli - 1];
+    const InverseScalingConstants scaling = INVERSE_SCALING_CONSTANTS[num_moduli];
     /* Execute parallel computation */
     // ExecBlas(nthreads, queue);
     #pragma omp parallel for num_threads(nthreads) schedule(static) shared(sa, sb)
     for (int i = 0; i < nthreads; i++) {
         int thread_id = omp_get_thread_num();
-        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P * thread_id), sb, mask, rangeM, rangeN, c8, ldc8, modulus);
+        SmeGemmDriver(&newArgs, sa+ (LEVEL3_GEMM_Q*LEVEL3_GEMM_P * thread_id), sb, mask, rangeM, rangeN, c8, ldc8, scaling);
     }
 }
