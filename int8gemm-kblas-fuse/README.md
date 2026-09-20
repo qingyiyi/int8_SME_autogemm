@@ -35,24 +35,27 @@ cblas_gemm_s8s8s8(..., sa, sb, c8, ldc8, num_moduli)
 `int8_gemm.cpp` 不再包含 C++ inverse-scaling 双重循环，也不再包含浮点
 `rint/fma` 计算。它只负责：
 
-1. 按 `num_moduli` 选择 modulus；
+1. 在一次 GEMM 调用开始时按 `num_moduli` 选择 `modulus/inv_p/neg_p`；
 2. 为当前 GEMM tile 填充 `Int8FusedStoreParams`；
 3. 通过原 NN kernel 的既有 `buf` 参数把该结构传给汇编。
+
+B1 已经完成上述常量的外提和 ABI 传递，但当前汇编仍使用原来已验证的
+`SDIV + MLS` 路径；因此 B1 的目标是改变参数准备，不是改变结果算法或性能。
 
 inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生产
 `assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编在每个 ZA
 结果向量刚被 `MOVA` 取出后完成 inverse scaling，再用原有的 `UZP1 × 2 + ST1B`
 直接写 C8；`modulus=0` 路径直接写该 INT32 向量的低字节。
 
-非零 modulus 的 quotient 固定使用已验证的 reciprocal 实现：driver 为每个
-mode 传入 `floor(2^32 / modulus)`，汇编右移得到 `floor(2^31 / modulus)`，再以
-`SQDMULH + MLS + 两个单步余数归一化` 得到精确余数，最后转换为 centered remainder。
-这条路径不使用 `SDIV`、FP32/FP64 或饱和窄化；`modulus=0` 仍跳过 reciprocal setup，
-直接保留 INT32 的低字节。
+非零 modulus 的 quotient 使用已验证的 signed vector `SDIV` 实现。对每个刚从
+ZA 取出的 INT32 输出向量，汇编计算 `q = trunc(value / modulus)`，再用 `MLS`
+重构余数并修正到 centered-remainder 区间。这里的 `SDIV` 分子是当前输出元素，
+不是计算 `1 / modulus`；因此它必须对每个输出向量执行。`modulus=0` 路径跳过
+`SDIV`，直接保留 INT32 的低字节。
 
 该实现仅改变 `MOVA ZA.S -> Z.S` 后的 inverse-scaling epilogue。MOPA、ZA
 accumulation、packing、tile traversal、C8 地址映射和最终 `UZP1 × 2 + ST1B`
-low-byte/wrap store 均保持不变；没有 `SDIV` fallback 或临时构建开关。
+low-byte/wrap store 均保持不变。
 
 ### 汇编 ABI
 
@@ -62,14 +65,20 @@ low-byte/wrap store 均保持不变；没有 `SDIV` fallback 或临时构建开�
 |---:|---|---|
 | 0 | `c8` | 当前 C8 tile 首地址 |
 | 8 | `modulus` | 0 或选中的正奇数模数 |
-| 12 | `reciprocal_magic` | `floor(2^32 / modulus)`；mode 0 为 0；magic epilogue 用其右移一位得到 `floor(2^31 / modulus)` |
+| 12 | `reserved` | 保留，必须为 0 |
+| 16 | `inv_p` | `1.0 / modulus`；mode 0 为 0.0 |
+| 24 | `neg_p` | `-modulus`；mode 0 为 0.0 |
 
-结构体总大小为 16 bytes。生产 driver 为每个 NN tile 创建该参数块，并把当前
-C8 tile 首地址和 `ldc8` 传给 kernel 的两个输出槽。原 kernel 的输出遍历仍按
-已验证的 INT32 坐标平面推进；汇编将其字节位移除以 4，直接得到相对于 `c8`
-的字节位移，因此不需要在参数块中重复保存 `ldc8`。这些虚拟地址从不被
-`ldr/str` 解引用。`buf` 的实际栈位置由现有 prologue/save-area 约定确定，修改
-kernel 参数顺序或 `SAVE_REGS` 布局时必须同步更新汇编。
+结构体总大小为 32 bytes，按 16 bytes 对齐。生产 driver 在一次 public GEMM
+调用开始时根据 `num_moduli` 选定这三个常量，然后为每个 NN tile 填入参数块。
+表中的 `1.0 / p` 是 `constexpr` 初始化，只在编译期求值，不会在 GEMM 调用或
+tile 循环中执行除法。
+当前 B1 的 SDIV epilogue 仍只读取 offset 0/8 的 `c8`/`modulus`，所以算法和
+结果不变；B2 才会读取 offset 16/24 的 FP64 常量并替换汇编算术。原 kernel 的
+输出遍历仍按已验证的 INT32 坐标平面推进；汇编将其字节位移除以 4，直接得到
+相对于 `c8` 的字节位移，因此不需要在参数块中重复保存 `ldc8`。这些虚拟地址
+从不被 `ldr/str` 解引用。`buf` 的实际栈位置由现有 prologue/save-area 约定
+确定，修改 kernel 参数顺序或 `SAVE_REGS` 布局时必须同步更新汇编。
 
 ## 本机验证（不执行 SME 汇编）
 
@@ -83,9 +92,10 @@ make -B test-host
 
 该命令验证：
 
-- FP64 reference、整数 centered-remainder oracle、最终 SQDMULH fixed-reciprocal model、所有 19 个模数和低字节路径；
+- FP64 reference、整数 centered-remainder oracle、所有 19 个模数和低字节路径；
 - INT32 累加器边界、guard/padding 和固定 K=2048 的标量参考；
-- 生产 C++ driver 的 C8 tile 地址、C8 stride、modulus 传递和 1/32 线程分块；
+- 生产 C++ driver 的 C8 tile 地址、C8 stride、modulus/`inv_p`/`neg_p` 传递和
+  1/32 线程分块；
 - 虚拟四字节 word 坐标到 C8 字节地址的 `>> 2` 转换：覆盖 2048/8192、非 4 字节对齐的
   C8 stride、SAVE_ZACOL 的 0..3 个 VL 偏移、16..256-byte VL、tile 边界与尾向量；
 - mock kernel 写入 marker，确认 C++ 返回后没有隐藏的 inverse-scaling pass。
@@ -127,15 +137,15 @@ make -B perf
 ./test_fused_gemm 8192 8192 2048 32 all 10 3
 ```
 
-`mode 0` 是 low-byte 路径，跳过 reciprocal setup；`mode 1..19` 使用最终的
-SQDMULH fixed-reciprocal epilogue。最后一个参数 `3` 是**每个 mode 的 untimed
-warmup 次数**；它会在该 mode 的统计前完整执行 GEMM，但不计入 `fused_time`。默认值
-也是 3，只有需要故意观察冷启动时才应显式传入 `0`。
+`mode 0` 是 low-byte 路径，跳过 `SDIV`；`mode 1..19` 使用 centered-remainder
+SDIV epilogue。最后一个参数 `3` 是**每个 mode 的 untimed warmup 次数**；它会在
+该 mode 的统计前完整执行 GEMM，但不计入 `fused_time`。默认值也是 3，只有需要
+故意观察冷启动时才应显式传入 `0`。
 
 正确性测试只分配最终 C8，并检查 C8 padding/guard 和 A/B 输入不被修改；生产路径
 不会分配或检查 C32。测试在确定性的 2048 block 边界、128 行/32 列 kernel 边界和
-内部坐标处运行独立 INT32 标量 accumulator reference，再以独立的 integer、FP64 和
-SQDMULH fixed-reciprocal oracle 验证 C8。
+内部坐标处运行独立 INT32 标量 accumulator reference，再以独立的 integer 和 FP64
+oracle 验证 C8。
 
 若失败，请保留完整的第一条 `RUN ...`、`PRODUCTION FAIL: ...`，以及编译器报告的
 第一处汇编/链接错误。优先确认：

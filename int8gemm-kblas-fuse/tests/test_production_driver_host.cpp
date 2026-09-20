@@ -56,6 +56,17 @@ int32_t expected_accumulator(int row, int col) {
     return static_cast<int32_t>(((row * 131 + col * 17 + 7) % 100003) - 50001);
 }
 
+Int8FusedStoreParams expected_scaling(unsigned mode) {
+    Int8FusedStoreParams expected{};
+    if (mode != 0) {
+        const double p = static_cast<double>(fusion_test::kModuli[mode - 1]);
+        expected.modulus = static_cast<int32_t>(p);
+        expected.inv_p = 1.0 / p;
+        expected.neg_p = -p;
+    }
+    return expected;
+}
+
 bool tile_origin(const Int8FusedStoreParams* params, BLASLONG* row, BLASLONG* col) {
     if (g_invocation == nullptr || params == nullptr || params->c8 == nullptr) {
         return false;
@@ -238,16 +249,14 @@ extern "C" void int8_sme_gemm_kernel_nn(
     const auto* params = static_cast<const Int8FusedStoreParams*>(buf);
     BLASLONG base_row = 0;
     BLASLONG base_col = 0;
-    const int32_t expected_modulus = invocation != nullptr && invocation->mode != 0
-        ? fusion_test::kModuli[invocation->mode - 1]
-        : 0;
-    const uint32_t expected_magic = invocation != nullptr && invocation->mode != 0
-        ? fusion_test::kReciprocalMagic[invocation->mode - 1]
-        : 0u;
+    const Int8FusedStoreParams expected = invocation != nullptr
+        ? expected_scaling(invocation->mode)
+        : Int8FusedStoreParams{};
     if (invocation == nullptr || params == nullptr || k != kK || alpha != 1.0f ||
         params->c8 != c8 || ldc8 != kLdc8 ||
-        params->modulus != expected_modulus ||
-        params->reciprocal_magic != expected_magic || rows <= 0 || cols <= 0 ||
+        params->modulus != expected.modulus || params->reserved != 0 ||
+        params->inv_p != expected.inv_p || params->neg_p != expected.neg_p ||
+        rows <= 0 || cols <= 0 ||
         !tile_origin(params, &base_row, &base_col) || base_row + rows > kM ||
         base_col + cols > kN) {
         if (invocation != nullptr) invocation->invalid.store(true);
@@ -283,7 +292,7 @@ int main() {
         // marker would be overwritten and this call fails.
         run_one(1, 1, C8Behavior::Marker);
         std::cout << "PASS host production-driver mock: virtual word-to-C8 address "
-                     "mapping, C8-only API wiring, all modulus/magic pairs, C8 stride, padding, "
+                     "mapping, C8-only API wiring, all moduli, C8 stride, padding, "
                      "1/32-thread tiling, and absence of a post-kernel C++ "
                      "inverse-scaling pass verified.\n";
         return 0;

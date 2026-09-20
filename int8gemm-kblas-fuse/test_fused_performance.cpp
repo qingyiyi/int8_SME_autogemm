@@ -293,7 +293,7 @@ double run_mode(const Options& options, unsigned mode,
 
     // Every selected mode gets its own warmup.  In particular, a mode list
     // such as "0,1,19" no longer lets mode 0 absorb process/kernel startup and
-    // then reports mode 1 as the first cold reciprocal measurement.
+    // then reports mode 1 as the first cold SDIV measurement.
     warmup_mode(options, mode, a, b, c8, sa, sb, lda, ldb, ldc8);
 
     const size_t c8_bytes = static_cast<size_t>(ldc8) * options.n;

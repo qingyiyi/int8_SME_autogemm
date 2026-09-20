@@ -55,13 +55,12 @@ int main() {
         const auto check = [&](int32_t value, unsigned mode) {
             const int actual = fusion_test::inverse_fp64(value, mode);
             const int expected = fusion_test::inverse_integer(value, mode);
-            const int fused_magic =
-                fusion_test::inverse_fused_magic_scalar_model(value, mode);
-            require(actual == expected && fused_magic == expected,
+            const int fused_scalar = fusion_test::inverse_fused_scalar_model(value, mode);
+            require(actual == expected && fused_scalar == expected,
                     "inverse mismatch: C=" + std::to_string(value) +
                     " mode=" + std::to_string(mode) + " fp64=" + std::to_string(actual) +
                     " integer=" + std::to_string(expected) +
-                    " fused_magic=" + std::to_string(fused_magic));
+                    " fused_scalar=" + std::to_string(fused_scalar));
             ++checked;
         };
         std::mt19937 rng(20260910);
@@ -69,13 +68,7 @@ int main() {
             for (int value = -32768; value <= 32767; ++value) check(value, mode);
             for (int32_t value : {
                      std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::min() + 1,
-                     -fusion_test::kMaximumAccumulatorMagnitude - 1,
-                     -fusion_test::kMaximumAccumulatorMagnitude,
-                     -fusion_test::kMaximumAccumulatorMagnitude + 1,
                      -16777217, -16777216, 16777215, 16777216, 16777217,
-                     fusion_test::kMaximumAccumulatorMagnitude - 1,
-                     fusion_test::kMaximumAccumulatorMagnitude,
-                     fusion_test::kMaximumAccumulatorMagnitude + 1,
                      std::numeric_limits<int32_t>::max() - 1, std::numeric_limits<int32_t>::max()}) {
                 check(value, mode);
             }
@@ -112,8 +105,7 @@ int main() {
         test_guards();
         test_accumulator_oracle();
         std::cout << "PASS host reference: " << checked
-                  << " inverse cases including the final SQDMULH fixed-reciprocal model; guard fault "
-                     "injection; fixed-K accumulator oracle.\n"
+                  << " inverse cases; guard fault injection; fixed-K accumulator oracle.\n"
                   << "This is NOT an SME kernel acceptance test.\n";
         return 0;
     } catch (const std::exception& e) {

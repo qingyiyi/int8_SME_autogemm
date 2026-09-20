@@ -120,17 +120,23 @@ typedef enum CBLAS_TRANSPOSE {
 // helper maps that virtual coordinate back to a byte address below `c8` and
 // never dereferences it as C32.  The virtual LDC already contains the C8 stride,
 // so duplicating ldc8 in this structure would be redundant.
-struct Int8FusedStoreParams {
-    int8_t *c8;                 // column-major INT8 tile origin
-    int32_t modulus;            // 0: low byte; otherwise centered remainder modulus
-    uint32_t reciprocal_magic;  // floor(2^32 / modulus), or 0 for low-byte mode
+struct alignas(16) Int8FusedStoreParams {
+    int8_t *c8;         // column-major INT8 tile origin
+    int32_t modulus;    // 0: low byte; otherwise centered remainder modulus
+    uint32_t reserved;  // kept for ABI spacing and future use
+    double inv_p;       // 1.0 / modulus; zero for low-byte mode
+    double neg_p;       // -modulus; zero for low-byte mode
 };
 
 static_assert(offsetof(Int8FusedStoreParams, c8) == 0, "fused ABI c8 offset");
 static_assert(offsetof(Int8FusedStoreParams, modulus) == 8, "fused ABI modulus offset");
-static_assert(offsetof(Int8FusedStoreParams, reciprocal_magic) == 12,
-              "fused ABI reciprocal-magic offset");
-static_assert(sizeof(Int8FusedStoreParams) == 16, "fused ABI size");
+static_assert(offsetof(Int8FusedStoreParams, reserved) == 12,
+              "fused ABI reserved offset");
+static_assert(offsetof(Int8FusedStoreParams, inv_p) == 16,
+              "fused ABI reciprocal offset");
+static_assert(offsetof(Int8FusedStoreParams, neg_p) == 24,
+              "fused ABI negative-modulus offset");
+static_assert(sizeof(Int8FusedStoreParams) == 32, "fused ABI size");
 
 extern "C" {
     // These two output arguments are C8 storage, even though the unchanged

@@ -15,7 +15,7 @@
 #ifdef INT8_INVERSE_SCALING_EPILOGUE
 	// The production NN path inverse-scales this just-extracted ZA vector and
 	// stores C8 directly; it never materializes a C32 output tile.
-	INT8_INVERSE_SCALING_DIRECT \pc, \off, \reg_pg, \rab0, \rc0
+	INT8_INVERSE_SCALING_DIRECT \pc, \off, \reg_pg, \rab0, \rc0, \t0
 #else
 	STNT1	 \rab0\().s, \reg_pg, [\pc, \off , MUL VL]
 #endif
@@ -124,42 +124,27 @@
 .endm
 
 .macro KERNEL_SAVE_C_1VL_1VL label
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
-	INT8_INVERSE_SCALING_PREPARE
-#endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,1VL, 1VL,za0
 	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
 .endm
 .macro KERNEL_SAVE_C_2VL_1VL label
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
-	INT8_INVERSE_SCALING_PREPARE
-#endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,2VL, 1VL,za0,za2
 	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
 .endm
 .macro KERNEL_SAVE_C_3VL_1VL label
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
-	INT8_INVERSE_SCALING_PREPARE
-#endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,3VL,1VL, za0,za2,za4
 	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
 .endm
 .macro KERNEL_SAVE_C_4VL_1VL label
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
-	INT8_INVERSE_SCALING_PREPARE
-#endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,4VL,1VL,za0,za2,za4,za6
 	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
 .endm
 
 .macro KERNEL_SAVE_C_BASE_2VL label,mvl
-#ifdef INT8_INVERSE_SCALING_EPILOGUE
-	INT8_INVERSE_SCALING_PREPARE
-#endif
     mov w12, #0
 
 	mov w13, #4

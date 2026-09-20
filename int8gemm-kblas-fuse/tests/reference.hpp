@@ -16,39 +16,6 @@ constexpr std::array<int32_t, 19> kModuli = {
     255, 253, 251, 247, 241, 239, 233, 229, 227, 223,
     217, 211, 199, 197, 193, 191, 181, 179, 173
 };
-// Frozen independently of the production dispatch table.  Each entry is
-// floor(2^32 / p) for the modulus at the same index.
-constexpr std::array<uint32_t, 19> kReciprocalMagic = {
-    16843009u, 16976155u, 17111423u, 17388531u, 17821441u,
-    17970574u, 18433336u, 18755315u, 18920560u, 19259943u,
-    19792476u, 20355295u, 21582750u, 21801864u, 22253716u,
-    22486739u, 23729101u, 23994230u, 24826400u
-};
-constexpr int32_t kMaximumAccumulatorMagnitude = kFixedK * 128 * 128;
-
-constexpr bool reciprocal_magic_is_exact() {
-    for (size_t i = 0; i < kModuli.size(); ++i) {
-        if (kReciprocalMagic[i] !=
-            (UINT64_C(1) << 32) / static_cast<uint32_t>(kModuli[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-static_assert(reciprocal_magic_is_exact(),
-              "frozen reciprocal table must equal floor(2^32 / p)");
-
-constexpr bool reciprocal_qdmulh_magic_is_exact() {
-    for (size_t i = 0; i < kModuli.size(); ++i) {
-        if ((kReciprocalMagic[i] >> 1) !=
-            (UINT64_C(1) << 31) / static_cast<uint32_t>(kModuli[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-static_assert(reciprocal_qdmulh_magic_is_exact(),
-              "SQDMULH magic must equal floor(2^31 / p)");
 
 inline int8_t low_byte(int32_t value) {
     const int byte = static_cast<uint32_t>(value) & 255u;
@@ -89,35 +56,21 @@ inline int8_t inverse_integer(int32_t value, unsigned mode) {
     return static_cast<int8_t>(remainder);
 }
 
-// Exact host model of the final SVE2/SME SQDMULH production path.  SQDMULH
-// returns the arithmetic high half of twice the signed product, i.e.
-// floor(value * floor(2^31/p) / 2^31) here.  The explicit signed floor helper
-// keeps this model independent of implementation-defined right shifts.
-inline int64_t signed_floor_divide_2_to_32(int64_t numerator) {
-    constexpr int64_t denominator = INT64_C(1) << 32;
-    if (numerator >= 0) return numerator / denominator;
-    // The input range below is far from INT64_MIN, so negation is safe.
-    return -((-numerator + denominator - 1) / denominator);
-}
-
-inline int8_t inverse_fused_magic_scalar_model(int32_t value, unsigned mode) {
+// Host model of the production scalar inverse-scaling epilogue.  It deliberately
+// follows `sdiv` + `msub` and the two signed correction branches rather than
+// using `%`, so this test catches a future change in the assembly algorithm.
+inline int8_t inverse_fused_scalar_model(int32_t value, unsigned mode) {
     check_mode(mode);
     if (mode == 0) return low_byte(value);
-
-    const int64_t p = static_cast<int64_t>(kModuli[mode - 1]);
-    const int64_t magic31 =
-        static_cast<int64_t>(kReciprocalMagic[mode - 1] >> 1);
-    // No saturation is possible: |2 * INT32_MIN * magic31| < 2^63 and the
-    // resulting quotient is far inside INT32's signed range.
-    const int64_t quotient = signed_floor_divide_2_to_32(
-        INT64_C(2) * static_cast<int64_t>(value) * magic31);
-    int64_t remainder = static_cast<int64_t>(value) - quotient * p;
-
-    // q0 is at most one away from floor(value/p).  These are exactly the two
-    // predicated normalizations in the assembly before centering the remainder.
-    if (remainder < 0) remainder += p;
-    if (remainder >= p) remainder -= p;
-    if (remainder > p / 2) remainder -= p;
+    const int32_t p = kModuli[mode - 1];
+    const int32_t half = p >> 1;
+    const int32_t quotient = value / p;  // AArch64 SDIV truncates toward zero.
+    int32_t remainder = value - quotient * p;  // AArch64 MSUB result.
+    if (remainder > half) {
+        remainder -= p;
+    } else if (remainder + half < 0) {
+        remainder += p;
+    }
     return static_cast<int8_t>(remainder);
 }
 
