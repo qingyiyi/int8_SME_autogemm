@@ -29,10 +29,10 @@
  *     q = rint((double)value * inv_p)
  *     r = fma(neg_p, q, (double)value)
  *
- * The conversion is deliberately performed in two halves.  A 64-byte SVE
- * vector contains sixteen INT32 lanes but only eight FP64 lanes; a widening
- * SCVTF/FCVTZS operation consumes/produces one half at a time.  The low and
- * high results are narrowed and stored separately, preserving INT32 lane order.
+ * A 64-byte SVE vector contains sixteen INT32 lanes but only eight FP64
+ * lanes.  The widening conversion maps d[i] to s[2*i], so the implementation
+ * processes even and odd INT32 lanes as two FP64 streams, then narrows and
+ * ZIP1-interleaves them back into the original INT32 lane order.
  *
  * In the fused NN build, the existing kernel C/ldc argument slots are kept as
  * a virtual INT32 coordinate plane so the proven GEMM traversal is unchanged.
@@ -75,22 +75,24 @@
     lsr     x4, x4, #2
     add     x4, x5, x4
 
-    // Count active INT32 lanes.  Split that count into the low/high FP64
-    // halves.  x5 is low_count (0..8), x6 is high_count (0..8).
+    // A widening SVE .s -> .d conversion maps destination d[i] to source
+    // s[2*i], not to source s[i].  Split the source into its *even* and *odd*
+    // INT32 lanes, rather than into low/high contiguous halves.  x6 holds the
+    // number of even lanes (ceil(count/2)); x5 then holds odd lanes
+    // (floor(count/2)).
     cntp    x5, \reg_pg, \reg_pg\().s
-    mov     x6, x5
-    subs    x6, x6, #8
-    csel    x6, x6, xzr, hs
+    add     x6, x5, #1
+    lsr     x6, x6, #1
     sub     x5, x5, x6
-    whilelt p5.d, xzr, x5
-    whilelt p6.d, xzr, x6
+    whilelt p5.d, xzr, x6
+    whilelt p6.d, xzr, x5
 
-    // SCVTF with a .d destination consumes the lower half of the .s source.
-    // EXT exposes the original INT32 high half in that same lower position.
-    // SVE EXT is destructive: its first input must be the destination.
-    // Copy the INT32 vector first, then rotate its high eight lanes down.
+    // Convert values {0,2,4,...} and {1,3,5,...} independently.  Rotating by
+    // one INT32 lane makes the original odd lanes occupy source positions
+    // {0,2,4,...} for the second widening conversion.  SVE EXT is destructive,
+    // so z18 must first receive a copy of the source vector.
     mov     z18.d, \value\().d
-    ext     z18.b, z18.b, z18.b, #32
+    ext     z18.b, z18.b, z18.b, #4
     scvtf   z19.d, p5/m, \value\().s
     scvtf   z20.d, p6/m, z18.s
 
@@ -107,8 +109,8 @@
     fmla    z20.d, p6/m, z22.d, z17.d
 
     // The remainder is integral and within INT8 for every supported modulus.
-    // Keep each half as FP64 until conversion, then narrow to one byte per
-    // original lane (d -> s -> h -> b).
+    // First compact each FP64 result vector to bytes; ZIP1 then restores the
+    // original lane order: even0, odd0, even1, odd1, ... .
     fcvtzs  z21.d, p5/m, z19.d
     fcvtzs  z22.d, p6/m, z20.d
     uzp1    z21.s, z21.s, z21.s
@@ -117,14 +119,13 @@
     uzp1    z22.s, z22.s, z22.s
     uzp1    z22.h, z22.h, z22.h
     uzp1    z22.b, z22.b, z22.b
+    zip1    z18.b, z21.b, z22.b
 
-    // Store low and high halves consecutively.  Rebuild byte predicates after
-    // the FP64 work; each predicate now describes bytes, not FP64 lanes.
-    whilelt  p5.b, xzr, x5
-    whilelt  p6.b, xzr, x6
-    st1b    { z21.b }, p5, [x4]
-    add     x6, x4, #8
-    st1b    { z22.b }, p6, [x6]
+    // Recover the original active-lane count and write one contiguous C8
+    // vector.  The byte predicate preserves partial final M tiles.
+    add     x5, x5, x6
+    whilelt p5.b, xzr, x5
+    st1b    { z18.b }, p5, [x4]
     b       9f
 
 8:
