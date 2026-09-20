@@ -87,7 +87,10 @@
 
     // SCVTF with a .d destination consumes the lower half of the .s source.
     // EXT exposes the original INT32 high half in that same lower position.
-    ext     z18.b, \value\().b, \value\().b, #32
+    // SVE EXT is destructive: its first input must be the destination.
+    // Copy the INT32 vector first, then rotate its high eight lanes down.
+    mov     z18.d, \value\().d
+    ext     z18.b, z18.b, z18.b, #32
     scvtf   z19.d, p5/m, \value\().s
     scvtf   z20.d, p6/m, z18.s
 
