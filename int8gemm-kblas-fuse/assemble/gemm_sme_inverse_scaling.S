@@ -87,15 +87,17 @@
 
     // SCVTF with a .d destination consumes the lower half of the .s source.
     // EXT exposes the original INT32 high half in that same lower position.
-    ext     z18.b, \value.b, \value.b, #32
-    scvtf   z19.d, p5/m, \value.s
+    ext     z18.b, \value\().b, \value\().b, #32
+    scvtf   z19.d, p5/m, \value\().s
     scvtf   z20.d, p6/m, z18.s
 
     // q = rint(value * inv_p).  Keep the converted original value in z19/z20
     // because the following FMLA must compute value + q * (-p), not q +
     // q * (-p).
-    fmul    z21.d, p5/m, z19.d, z16.d
-    fmul    z22.d, p6/m, z20.d, z16.d
+    mov     z21.d, z19.d
+    fmul    z21.d, p5/m, z21.d, z16.d
+    mov     z22.d, z20.d
+    fmul    z22.d, p6/m, z22.d, z16.d
     frintn  z21.d, p5/m, z21.d
     frintn  z22.d, p6/m, z22.d
     fmla    z19.d, p5/m, z21.d, z17.d
