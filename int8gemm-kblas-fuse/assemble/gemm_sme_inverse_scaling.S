@@ -9,8 +9,8 @@
  *   0  c8       8  modulus       12 reserved
  *  16  inv_p   24  neg_p         32-byte object, 16-byte aligned
  *
- * B1 populates inv_p/neg_p in the C++ driver, but this SDIV implementation
- * intentionally reads only c8 and modulus.  B2 will consume the FP64 fields.
+ * B1 populates inv_p/neg_p in the C++ driver.  B2 consumes those FP64 fields
+ * here, so the GEMM call never performs the reciprocal division.
  */
 
 #define INVERSE_SCALING_PARAMS_C8       0
@@ -23,16 +23,16 @@
  * then store its INT8 result directly to C8.
  *
  * For modulus == 0, the operation is the low eight bits of each INT32 lane.
- * For a supported nonzero modulus p (all p are positive odd values), the
- * centered remainder is computed as:
+ * For a supported nonzero modulus p (all p are positive odd values), this is
+ * the original FP64 operation:
  *
- *     q = trunc(value / p)
- *     r = value - q * p
- *     if (r >  p/2) r -= p
- *     if (r < -p/2) r += p
+ *     q = rint((double)value * inv_p)
+ *     r = fma(neg_p, q, (double)value)
  *
- * This is the same integer form used by the validated scalar epilogue and is
- * equivalent to the old FP64 rint/fma result for the supported odd moduli.
+ * The conversion is deliberately performed in two halves.  A 64-byte SVE
+ * vector contains sixteen INT32 lanes but only eight FP64 lanes; a widening
+ * SCVTF/FCVTZS operation consumes/produces one half at a time.  The low and
+ * high results are narrowed and stored separately, preserving INT32 lane order.
  *
  * In the fused NN build, the existing kernel C/ldc argument slots are kept as
  * a virtual INT32 coordinate plane so the proven GEMM traversal is unchanged.
@@ -40,22 +40,29 @@
  * Converting the virtual byte displacement to an INT32 element displacement
  * therefore gives the real C8 byte address directly, without loading `ldc8`.
  *
- * x4/x5/x6 are dead after GEMM reaches SAVE_ZACOL.  p5/p6 are temporary
+ * x4/x5/x6 are dead after GEMM reaches SAVE_ZACOL; x7 remains reserved for the kernel C slot.  p5/p6 are temporary
  * predicates: MOPA predicates for the just-finished M block, rebuilt before a
- * later M block can accumulate.  The live p0-p4/p7 traversal predicates and the
- * p1/p2 MOVA predicates are left intact.  SAVE_ZACOL passes two scratch Z
- * registers (`tmp_q` and `tmp_mod`) which are disjoint from the current value
- * register in every existing save-register schedule.
+ * later M block can accumulate.  The live p0-p4/p7 traversal predicates and
+ * the p1/p2 MOVA predicates are left intact.  z16-z22 are epilogue-only
+ * temporaries in the production (non-DOUBLE) INT8 save schedule; the current
+ * value and the two macro-provided scratch registers are never overwritten.
  */
 .macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q,tmp_mod
     // The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176.
     ldr     x4, [sp, #(11 * 16 + 8)]
     cbz     x4, 9f
 
-    // x4 becomes the destination address below.  x4/x5/x6 originally hold
-    // LDA/origPB/LDB and are dead once GEMM reaches SAVE_ZACOL.
+    // Read the per-call constants before x4 is reused for the destination.
     ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
     ldr     x5, [x4, #INVERSE_SCALING_PARAMS_C8]
+    cbz     w6, 8f
+
+    // The constants are prepared once by the C++ caller.  Broadcast them to
+    // FP64 lanes; no SDIV or reciprocal operation is performed in the kernel.
+    ldr     x6, [x4, #INVERSE_SCALING_PARAMS_INV_P]
+    dup     z16.d, x6
+    ldr     x6, [x4, #INVERSE_SCALING_PARAMS_NEG_P]
+    dup     z17.d, x6
 
     // The proven GEMM traversal presents a virtual INT32 address plane whose
     // numeric base is c8_tile.  Converting its byte displacement to an
@@ -68,35 +75,62 @@
     lsr     x4, x4, #2
     add     x4, x5, x4
 
-    // Narrowing an active prefix of S lanes produces one contiguous B lane
-    // per original INT32 lane.  Build the matching byte predicate once.
+    // Count active INT32 lanes.  Split that count into the low/high FP64
+    // halves.  x5 is low_count (0..8), x6 is high_count (0..8).
     cntp    x5, \reg_pg, \reg_pg\().s
-    whilelt p6.b, xzr, x5
+    mov     x6, x5
+    subs    x6, x6, #8
+    csel    x6, x6, xzr, hs
+    sub     x5, x5, x6
+    whilelt p5.d, xzr, x5
+    whilelt p6.d, xzr, x6
 
-    // A zero modulus is the low-byte mode and must not execute SDIV.
-    cbz     w6, 8f
+    // SCVTF with a .d destination consumes the lower half of the .s source.
+    // EXT exposes the original INT32 high half in that same lower position.
+    ext     z18.b, \value.b, \value.b, #32
+    scvtf   z19.d, p5/m, \value.s
+    scvtf   z20.d, p6/m, z18.s
 
-    // q = trunc(value / p), with SDIV's required destructive numerator.
-    dup     \tmp_mod\().s, w6
-    mov     \tmp_q\().d, \value\().d
-    sdiv    \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s, \tmp_mod\().s
+    // q = rint(value * inv_p).  Keep the converted original value in z19/z20
+    // because the following FMLA must compute value + q * (-p), not q +
+    // q * (-p).
+    fmul    z21.d, p5/m, z19.d, z16.d
+    fmul    z22.d, p6/m, z20.d, z16.d
+    frintn  z21.d, p5/m, z21.d
+    frintn  z22.d, p6/m, z22.d
+    fmla    z19.d, p5/m, z21.d, z17.d
+    fmla    z20.d, p6/m, z22.d, z17.d
 
-    // value <- value - q*p (MLS is the predicated destructive form).
-    mls     \value\().s, \reg_pg\()/M, \tmp_q\().s, \tmp_mod\().s
+    // The remainder is integral and within INT8 for every supported modulus.
+    // Keep each half as FP64 until conversion, then narrow to one byte per
+    // original lane (d -> s -> h -> b).
+    fcvtzs  z21.d, p5/m, z19.d
+    fcvtzs  z22.d, p6/m, z20.d
+    uzp1    z21.s, z21.s, z21.s
+    uzp1    z21.h, z21.h, z21.h
+    uzp1    z21.b, z21.b, z21.b
+    uzp1    z22.s, z22.s, z22.s
+    uzp1    z22.h, z22.h, z22.h
+    uzp1    z22.b, z22.b, z22.b
 
-    // Correct the signed remainder into the centered interval.
-    // x5 is no longer needed after WHILELT, so reuse it for floor(p/2).
-    lsr     w5, w6, #1                  // floor(p/2), p is odd
-    dup     \tmp_q\().s, w5
-    cmpgt   p5.s, \reg_pg\()/z, \value\().s, \tmp_q\().s
-    sub     \value\().s, p5/m, \value\().s, \tmp_mod\().s
-
-    neg     \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s
-    cmpgt   p5.s, \reg_pg\()/z, \tmp_q\().s, \value\().s
-    add     \value\().s, p5/m, \value\().s, \tmp_mod\().s
+    // Store low and high halves consecutively.  Rebuild byte predicates after
+    // the FP64 work; each predicate now describes bytes, not FP64 lanes.
+    whilelt  p5.b, xzr, x5
+    whilelt  p6.b, xzr, x6
+    st1b    { z21.b }, p5, [x4]
+    add     x6, x4, #8
+    st1b    { z22.b }, p6, [x6]
+    b       9f
 
 8:
-    // Keep the low byte of each (possibly corrected) INT32 lane.
+    // Mode zero is the established low-byte path and must not execute any
+    // floating-point or division instruction.
+    addvl   x4, \pc, \off
+    sub     x4, x4, x5
+    lsr     x4, x4, #2
+    add     x4, x5, x4
+    cntp    x5, \reg_pg, \reg_pg\().s
+    whilelt p6.b, xzr, x5
     uzp1    \value\().h, \value\().h, \value\().h
     uzp1    \value\().b, \value\().b, \value\().b
     st1b    { \value\().b }, p6, [x4]
