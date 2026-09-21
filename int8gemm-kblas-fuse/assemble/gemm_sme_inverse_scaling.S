@@ -40,52 +40,92 @@
  * Converting the virtual byte displacement to an INT32 element displacement
  * therefore gives the real C8 byte address directly, without loading `ldc8`.
  *
- * x4/x5/x6 are dead after GEMM reaches SAVE_ZACOL; x7 remains reserved for the kernel C slot.  p5/p6 are temporary
- * predicates: MOPA predicates for the just-finished M block, rebuilt before a
- * later M block can accumulate.  The live p0-p4/p7 traversal predicates and
- * the p1/p2 MOVA predicates are left intact.  z16-z22 are epilogue-only
- * temporaries in the production (non-DOUBLE) INT8 save schedule; the current
- * value and the two macro-provided scratch registers are never overwritten.
+ * The parameter block is invariant during one kernel invocation, but the GEMM
+ * compute phase needs the ordinary working registers.  PREPARE therefore runs
+ * once at the entry of each completed ZA save tile, after accumulation has
+ * finished.  It caches:
+ *
+ *   x5      C8 tile base and null-store sentinel
+ *   p9      nonzero-modulus flag (all true) or low-byte-mode flag (all false)
+ *   z27.d   broadcast inv_p
+ *   z28.d   broadcast neg_p
+ *
+ * The scalar modulus is loaded exactly once by PREPARE only to construct p9;
+ * it is not needed in the FP64 arithmetic after neg_p has been broadcast.
+ * This deliberately leaves x4/x6 as per-vector scratch registers.  p8 holds
+ * the final byte-store predicate, while p5/p6 are the temporary even/odd FP64
+ * predicates.  The live p0-p4/p7 traversal predicates and p1/p2 MOVA
+ * predicates are untouched.  z18-z22 are epilogue-only temporaries in the
+ * production (non-DOUBLE) save schedule; z27/z28 are not used by any save
+ * schedule after PREPARE.
  */
-.macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q,tmp_mod
-    // The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176.
+
+/*
+ * Load the invariant fused-store state once for a completed ZA save tile.
+ *
+ * The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176 bytes.
+ * p9 is cleared first so a null buf, a null c8 base, or mode zero cannot retain
+ * state from a preceding tile.  Mode zero intentionally avoids both FP64
+ * constant loads and FP64 arithmetic in the direct helper.
+ */
+.macro INT8_INVERSE_SCALING_PREPARE
+    mov     x5, xzr
+    whilelt p9.b, xzr, xzr
+
     ldr     x4, [sp, #(11 * 16 + 8)]
     cbz     x4, 9f
 
-    // Read the per-call constants before x4 is reused for the destination.
-    ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
     ldr     x5, [x4, #INVERSE_SCALING_PARAMS_C8]
-    cbz     w6, 8f
+    ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
+    cbz     x5, 9f
+    cbz     w6, 9f
 
-    // The constants are prepared once by the C++ caller.  Broadcast them to
-    // FP64 lanes; no SDIV or reciprocal operation is performed in the kernel.
+    ptrue   p9.b, all
     ldr     x6, [x4, #INVERSE_SCALING_PARAMS_INV_P]
-    dup     z16.d, x6
+    dup     z27.d, x6
     ldr     x6, [x4, #INVERSE_SCALING_PARAMS_NEG_P]
-    dup     z17.d, x6
+    dup     z28.d, x6
+9:
+.endm
+
+/*
+ * Consume one MOVA result vector using state prepared by
+ * INT8_INVERSE_SCALING_PREPARE.  There are no parameter-block loads or
+ * constant broadcasts in this hot per-vector path.
+ */
+.macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q,tmp_mod
+    // x5 is a stable C8 base for the whole save tile; PREPARE clears it for a
+    // null parameter block, so it also safely suppresses stores in that case.
+    cbz     x5, 9f
+
+    // Build the C8 byte predicate before x4/x6 are reused for the FP64 lane
+    // counts and destination-address scratch.  p8 is otherwise unused by the
+    // GEMM/save traversal.
+    cntp    x4, \reg_pg, \reg_pg\().s
+    whilelt p8.b, xzr, x4
+
+    // p9 was made all-true only for a nonzero modulus.  It replaces a repeated
+    // per-vector modulus load while preserving the low-byte fast path.
+    b.none  p9.b, 8f
+
+    // A widening SVE .s -> .d conversion maps destination d[i] to source
+    // s[2*i], not to source s[i].  Split the source into its even and odd
+    // INT32 lanes.  x6 holds ceil(count/2); x4 is then floor(count/2).
+    add     x6, x4, #1
+    lsr     x6, x6, #1
+    sub     x4, x4, x6
+    whilelt p5.d, xzr, x6
+    whilelt p6.d, xzr, x4
 
     // The proven GEMM traversal presents a virtual INT32 address plane whose
     // numeric base is c8_tile.  Converting its byte displacement to an
-    // element displacement maps it directly onto the byte-addressed C8 tile;
-    // no row/column divide and no ldc8 load are required:
+    // element displacement maps it directly onto the byte-addressed C8 tile:
     //
     //   dst = c8_tile + ((pc + off * VL) - c8_tile) / sizeof(int32_t)
     addvl   x4, \pc, \off
     sub     x4, x4, x5
     lsr     x4, x4, #2
     add     x4, x5, x4
-
-    // A widening SVE .s -> .d conversion maps destination d[i] to source
-    // s[2*i], not to source s[i].  Split the source into its *even* and *odd*
-    // INT32 lanes, rather than into low/high contiguous halves.  x6 holds the
-    // number of even lanes (ceil(count/2)); x5 then holds odd lanes
-    // (floor(count/2)).
-    cntp    x5, \reg_pg, \reg_pg\().s
-    add     x6, x5, #1
-    lsr     x6, x6, #1
-    sub     x5, x5, x6
-    whilelt p5.d, xzr, x6
-    whilelt p6.d, xzr, x5
 
     // Convert values {0,2,4,...} and {1,3,5,...} independently.  Rotating by
     // one INT32 lane makes the original odd lanes occupy source positions
@@ -98,15 +138,15 @@
 
     // q = rint(value * inv_p).  Keep the converted original value in z19/z20
     // because the following FMLA must compute value + q * (-p), not q +
-    // q * (-p).
+    // q * (-p).  z27/z28 were broadcast once by PREPARE.
     mov     z21.d, z19.d
-    fmul    z21.d, p5/m, z21.d, z16.d
+    fmul    z21.d, p5/m, z21.d, z27.d
     mov     z22.d, z20.d
-    fmul    z22.d, p6/m, z22.d, z16.d
+    fmul    z22.d, p6/m, z22.d, z27.d
     frintn  z21.d, p5/m, z21.d
     frintn  z22.d, p6/m, z22.d
-    fmla    z19.d, p5/m, z21.d, z17.d
-    fmla    z20.d, p6/m, z22.d, z17.d
+    fmla    z19.d, p5/m, z21.d, z28.d
+    fmla    z20.d, p6/m, z22.d, z28.d
 
     // The remainder is integral and within INT8 for every supported modulus.
     // First compact each FP64 result vector to bytes; ZIP1 then restores the
@@ -120,25 +160,18 @@
     uzp1    z22.h, z22.h, z22.h
     uzp1    z22.b, z22.b, z22.b
     zip1    z18.b, z21.b, z22.b
-
-    // Recover the original active-lane count and write one contiguous C8
-    // vector.  The byte predicate preserves partial final M tiles.
-    add     x5, x5, x6
-    whilelt p5.b, xzr, x5
-    st1b    { z18.b }, p5, [x4]
+    st1b    { z18.b }, p8, [x4]
     b       9f
 
 8:
-    // Mode zero is the established low-byte path and must not execute any
-    // floating-point or division instruction.
+    // Mode zero is the established low-byte path and must not execute FP64
+    // arithmetic.  The byte predicate was already built above.
     addvl   x4, \pc, \off
     sub     x4, x4, x5
     lsr     x4, x4, #2
     add     x4, x5, x4
-    cntp    x5, \reg_pg, \reg_pg\().s
-    whilelt p6.b, xzr, x5
     uzp1    \value\().h, \value\().h, \value\().h
     uzp1    \value\().b, \value\().b, \value\().b
-    st1b    { \value\().b }, p6, [x4]
+    st1b    { \value\().b }, p8, [x4]
 9:
 .endm
