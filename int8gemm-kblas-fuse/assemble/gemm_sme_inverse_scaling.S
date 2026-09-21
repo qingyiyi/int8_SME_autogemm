@@ -20,11 +20,24 @@
 #define INVERSE_SCALING_PARAMS_NEG_P    24
 
 /*
- * Stage A baseline: KERNEL_SAVE_C_* already invokes PREPARE at each completed
- * ZA save tile.  Keep that call site intact while restoring the legacy direct
- * SDIV path below, which still loads its scalar state per output vector.
+ * P1 fixed-full-tile fast path: KERNEL_SAVE_C_* invokes PREPARE once for each
+ * completed ZA save tile.  Under the production contract (M/N are multiples
+ * of 2048 and SVL is 64 bytes), every saved .s vector has exactly 16 active
+ * INT32 lanes.  After the two UZP1 compactions, its 16 C8 results occupy only
+ * bytes [0, 15] of the Z register.  Build that fixed store predicate once per
+ * tile instead of repeating CNT P + WHILELT for every MOVA result.
+ *
+ * Do not replace this with PTRUE p6.b: that would activate all 64 bytes and
+ * would store packed garbage beyond the 16 valid C8 results.  Partial-vector
+ * handling remains intentionally outside the fixed production contract.
+ *
+ * x4 is save-stage scratch at this point.  p6 is not used by the following
+ * SAVE_ZACOL calls as an input predicate (they use p1/p2), and is rebuilt by
+ * the GEMM traversal before the next MOPA phase.
  */
 .macro INT8_INVERSE_SCALING_PREPARE
+    mov     x4, #16
+    whilelt p6.b, xzr, x4
 .endm
 
 /*
@@ -69,10 +82,9 @@
     cbz     x5, 9f
     ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
 
-    // Build the final byte predicate while x4 is still free.  p6 is not a
-    // source predicate for this save invocation (reg_pg is p1 or p2).
-    cntp    x4, \reg_pg, \reg_pg\().s
-    whilelt p6.b, xzr, x4
+    // P1 PREPARE already made p6.b active for exactly the low 16 packed C8
+    // bytes.  reg_pg is p1 or p2 in production; all 16 .s lanes are active
+    // by the fixed M/N=2048-multiple contract.
 
     // Map the virtual INT32 save address to the byte-addressed C8 tile.
     addvl   x4, \pc, \off
