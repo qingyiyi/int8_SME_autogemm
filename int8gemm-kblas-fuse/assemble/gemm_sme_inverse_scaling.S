@@ -46,45 +46,56 @@
  * finished.  It caches:
  *
  *   x5      C8 tile base and null-store sentinel
- *   p9      nonzero-modulus flag (all true) or low-byte-mode flag (all false)
+ *   w6      one-bit mode state (zero: low-byte mode; one: FP64 inverse path)
  *   z27.d   broadcast inv_p
  *   z28.d   broadcast neg_p
  *
- * The scalar modulus is loaded exactly once by PREPARE only to construct p9;
- * it is not needed in the FP64 arithmetic after neg_p has been broadcast.
- * This deliberately leaves x4/x6 as per-vector scratch registers.  p8 holds
- * the final byte-store predicate, while p5/p6 are the temporary even/odd FP64
- * predicates.  The live p0-p4/p7 traversal predicates and p1/p2 MOVA
- * predicates are untouched.  z18-z22 are epilogue-only temporaries in the
- * production (non-DOUBLE) save schedule; z27/z28 are not used by any save
- * schedule after PREPARE.
+ * The scalar modulus is loaded exactly once by PREPARE.  DIRECT tests the
+ * cached one-bit state before reusing x6 for lane counts, then restores w6
+ * before returning so the next vector in the same save tile sees the same
+ * mode.  The virtual C32 base/stride registers are part of the proven
+ * traversal and must never be used as epilogue scratch.  p5/p6 are temporary
+ * even/odd FP64 predicates; p5 is reused as the final byte-store predicate
+ * after the FP64 work finishes.
+ * The live p0-p4/p7 traversal predicates and p1/p2 MOVA predicates are left
+ * intact.  z18-z22 are epilogue-only temporaries in the production
+ * (non-DOUBLE) save schedule; z27/z28 are not used by any save schedule after
+ * PREPARE.
  */
 
 /*
  * Load the invariant fused-store state once for a completed ZA save tile.
  *
  * The 11th argument (buf) is at incoming sp+8; SAVE_REGS subtracts 176 bytes.
- * p9 is cleared first so a null buf, a null c8 base, or mode zero cannot retain
- * state from a preceding tile.  Mode zero intentionally avoids both FP64
- * constant loads and FP64 arithmetic in the direct helper.
+ * x5 and w6 are cleared first so a null buf, a null c8 base, or mode zero
+ * cannot retain state from a preceding tile.  Mode zero intentionally avoids
+ * both FP64 constant loads and FP64 arithmetic in the direct helper.
+ *
+ * The target BiSheng assembler permits only p0-p7 in SVE memory operations.
+ * Keeping the mode in w6 avoids the former high-predicate dependency entirely
+ * while retaining the tile-level preload of c8, inv_p, and neg_p.
  */
 .macro INT8_INVERSE_SCALING_PREPARE
     mov     x5, xzr
-    whilelt p9.b, xzr, xzr
+    mov     w6, wzr
 
     ldr     x4, [sp, #(11 * 16 + 8)]
     cbz     x4, 9f
 
     ldr     x5, [x4, #INVERSE_SCALING_PARAMS_C8]
-    ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
     cbz     x5, 9f
+
+    ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
     cbz     w6, 9f
 
-    ptrue   p9.b, all
     ldr     x6, [x4, #INVERSE_SCALING_PARAMS_INV_P]
     dup     z27.d, x6
     ldr     x6, [x4, #INVERSE_SCALING_PARAMS_NEG_P]
     dup     z28.d, x6
+
+    // Only the mode is needed after the broadcasts.  Canonicalize it so the
+    // direct helper can restore it after using x6 as a scalar scratch.
+    mov     w6, #1
 9:
 .endm
 
@@ -98,24 +109,19 @@
     // null parameter block, so it also safely suppresses stores in that case.
     cbz     x5, 9f
 
-    // Build the C8 byte predicate before x4/x6 are reused for the FP64 lane
-    // counts and destination-address scratch.  p8 is otherwise unused by the
-    // GEMM/save traversal.
-    cntp    x4, \reg_pg, \reg_pg\().s
-    whilelt p8.b, xzr, x4
-
-    // p9 was made all-true only for a nonzero modulus.  It replaces a repeated
-    // per-vector modulus load while preserving the low-byte fast path.
-    b.none  p9.b, 8f
+    // w6 was loaded once by PREPARE as a mode bit.  It is restored at the end
+    // of each path because x6 is otherwise the per-vector lane-count scratch.
+    cbz     w6, 8f
 
     // A widening SVE .s -> .d conversion maps destination d[i] to source
     // s[2*i], not to source s[i].  Split the source into its even and odd
-    // INT32 lanes.  x6 holds ceil(count/2); x4 is then floor(count/2).
-    add     x6, x4, #1
-    lsr     x6, x6, #1
-    sub     x4, x4, x6
-    whilelt p5.d, xzr, x6
-    whilelt p6.d, xzr, x4
+    // INT32 lanes.  x4 holds ceil(count/2); x6 then holds floor(count/2).
+    cntp    x6, \reg_pg, \reg_pg\().s
+    add     x4, x6, #1
+    lsr     x4, x4, #1
+    sub     x6, x6, x4
+    whilelt p5.d, xzr, x4
+    whilelt p6.d, xzr, x6
 
     // The proven GEMM traversal presents a virtual INT32 address plane whose
     // numeric base is c8_tile.  Converting its byte displacement to an
@@ -160,18 +166,29 @@
     uzp1    z22.h, z22.h, z22.h
     uzp1    z22.b, z22.b, z22.b
     zip1    z18.b, z21.b, z22.b
-    st1b    { z18.b }, p8, [x4]
+
+    // Rebuild the C8 predicate after p5 has been used for FP64 lanes.  Doing
+    // CNT P again avoids retaining the count in the live virtual-stride
+    // register.
+    cntp    x6, \reg_pg, \reg_pg\().s
+    whilelt p5.b, xzr, x6
+    st1b    { z18.b }, p5, [x4]
+    mov     w6, #1
     b       9f
 
 8:
     // Mode zero is the established low-byte path and must not execute FP64
-    // arithmetic.  The byte predicate was already built above.
+    // arithmetic.  p5 is a low predicate register accepted by the target
+    // assembler for the final byte store.
+    cntp    x6, \reg_pg, \reg_pg\().s
     addvl   x4, \pc, \off
     sub     x4, x4, x5
     lsr     x4, x4, #2
     add     x4, x5, x4
+    whilelt p5.b, xzr, x6
     uzp1    \value\().h, \value\().h, \value\().h
     uzp1    \value\().b, \value\().b, \value\().b
-    st1b    { \value\().b }, p8, [x4]
+    st1b    { \value\().b }, p5, [x4]
+    mov     w6, wzr
 9:
 .endm
