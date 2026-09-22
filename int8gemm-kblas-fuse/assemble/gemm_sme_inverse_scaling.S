@@ -9,32 +9,15 @@
  *   0  c8       8  modulus       12 reserved
  *  16  inv_p   24  neg_p         32-byte object, 16-byte aligned
  *
- * P2 compiles this existing source twice, with one epilogue specialization in
- * each object:
- *
- *   INT8_INVERSE_SCALING_LOWBYTE_KERNEL: mode 0, pack/store low bytes only.
- *   INT8_INVERSE_SCALING_SDIV_KERNEL:    modes 1..19, centered SDIV residue.
- *
- * The C++ driver selects the internal kernel once before its tile loops.  The
- * low-byte assembly therefore neither loads modulus nor contains SDIV/MLS or
- * the former per-vector mode branch.  The retained inv_p/neg_p ABI fields are
- * intentionally not consumed by either integer epilogue.
+ * This is the restored integer SDIV implementation.  It intentionally reads
+ * only c8 and modulus; the currently retained inv_p/neg_p ABI fields are not
+ * consumed by this epilogue.
  */
 
 #define INVERSE_SCALING_PARAMS_C8       0
 #define INVERSE_SCALING_PARAMS_MODULUS  8
 #define INVERSE_SCALING_PARAMS_INV_P    16
 #define INVERSE_SCALING_PARAMS_NEG_P    24
-
-// A fused NN object must contain exactly one P2 epilogue specialization.
-#if defined(INT8_INVERSE_SCALING_LOWBYTE_KERNEL) && \
-    defined(INT8_INVERSE_SCALING_SDIV_KERNEL)
-#error "select exactly one INT8 inverse-scaling kernel specialization"
-#endif
-#if !defined(INT8_INVERSE_SCALING_LOWBYTE_KERNEL) && \
-    !defined(INT8_INVERSE_SCALING_SDIV_KERNEL)
-#error "missing INT8 inverse-scaling kernel specialization"
-#endif
 
 /*
  * P1 fixed-full-tile fast path: KERNEL_SAVE_C_* invokes PREPARE once for each
@@ -61,9 +44,9 @@
  * Apply inverse scaling to one INT32 vector which has just been read from ZA,
  * then store its INT8 result directly to C8.
  *
- * The low-byte specialization keeps the low eight bits of each INT32 lane.
- * The SDIV specialization is called only for supported positive odd modulus
- * p and computes the centered signed residue using exact integer arithmetic:
+ * For modulus == 0, the operation is the low eight bits of each INT32 lane.
+ * For every supported positive odd modulus p, the nonzero path computes the
+ * centered signed residue using exact integer arithmetic:
  *
  *     q = trunc(value / p)
  *     r = value - q * p
@@ -97,9 +80,7 @@
     // store sentinel for an invalid/disabled fused destination.
     ldr     x5, [x4, #INVERSE_SCALING_PARAMS_C8]
     cbz     x5, 9f
-#ifdef INT8_INVERSE_SCALING_SDIV_KERNEL
     ldr     w6, [x4, #INVERSE_SCALING_PARAMS_MODULUS]
-#endif
 
     // P1 PREPARE already made p6.b active for exactly the low 16 packed C8
     // bytes.  reg_pg is p1 or p2 in production; all 16 .s lanes are active
@@ -111,7 +92,9 @@
     lsr     x4, x4, #2
     add     x4, x5, x4
 
-#ifdef INT8_INVERSE_SCALING_SDIV_KERNEL
+    // Mode zero is the established low-byte path and must not execute SDIV.
+    cbz     w6, 8f
+
     // q = trunc(value / p).  SDIV uses a destructive numerator, so preserve
     // the source value in tmp_q.  tmp_mod contains a broadcast p.
     dup     \tmp_mod\().s, w6
@@ -130,10 +113,9 @@
     neg     \tmp_q\().s, \reg_pg\()/M, \tmp_q\().s
     cmpgt   p5.s, \reg_pg\()/z, \tmp_q\().s, \value\().s
     add     \value\().s, p5/m, \value\().s, \tmp_mod\().s
-#endif
 
-    // Keep the low byte of each (optionally corrected) INT32 lane and write
-    // C8 directly.  The P1 predicate contains exactly the packed 16 bytes.
+8:
+    // Keep the low byte of each corrected INT32 lane and write C8 directly.
     uzp1    \value\().h, \value\().h, \value\().h
     uzp1    \value\().b, \value\().b, \value\().b
     st1b    { \value\().b }, p6, [x4]

@@ -37,17 +37,16 @@ INCLUDES   := -I. -I./assemble -I./include
 ALL_CFLAGS := $(CFLAGS) $(ARCH_FLAGS) $(DEFINES) $(OPENMP) $(INCLUDES)
 
 # ---- 源文件 ----
-# The public CBLAS driver has one fused C8 path.  P2 builds two internal NN
-# epilogues from the same existing source: mode 0 low-byte and nonzero SDIV.
+# The production NN symbol includes the inverse-scaling epilogue.  There is
+# intentionally only one driver/kernel path in the final build.
 BASE_CPP_SRCS := int8_gemm.cpp
-BASE_ASM_SRCS := assemble/gemm_tcopy_zip.S \
+BASE_ASM_SRCS := assemble/gemm_sme_nn.S \
+                 assemble/gemm_tcopy_zip.S \
                  assemble/gemm_ncopy_unzip.S
 
 # ---- 目标文件 ----
 BASE_CPP_OBJS := $(BASE_CPP_SRCS:%.cpp=%.o)
-NN_ASM_OBJS   := assemble/gemm_sme_nn_lowbyte.o \
-                 assemble/gemm_sme_nn_sdiv.o
-BASE_ASM_OBJS := $(NN_ASM_OBJS) $(BASE_ASM_SRCS:assemble/%.S=assemble/%.o)
+BASE_ASM_OBJS := $(BASE_ASM_SRCS:assemble/%.S=assemble/%.o)
 BASE_OBJS     := $(BASE_CPP_OBJS) $(BASE_ASM_OBJS)
 
 # ---- 输出与测试 ----
@@ -93,7 +92,7 @@ TEST_ARGS ?= --m 8192 --n 8192 --threads 32 --modes all --repeat 1 --seed 42
 
 all: $(TARGET)
 
-# Link the single public production API and its internal NN specializations.
+# Link the single production API/kernel path.
 $(TARGET): $(BASE_OBJS)
 	$(CC) -shared $(OPENMP) -o $@ $^ -lm -lpthread -lnuma
 	@echo ">>> 生成成功: $@"
@@ -167,17 +166,12 @@ assemble/gemm_tcopy_zip.o: assemble/gemm_tcopy_zip.S
 assemble/gemm_ncopy_unzip.o: assemble/gemm_ncopy_unzip.S
 	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_oncopy -DASMFNAME=int8_sme_gemm_oncopy_ -DNAME=int8_sme_gemm_oncopy_ -DCNAME=int8_sme_gemm_oncopy -c $< -o $@
 
-# P2 compiles the same NN source twice.  Do not add/copy a second .S file:
-# the preprocessor selects the one valid epilogue implementation in each .o.
-assemble/gemm_sme_nn_lowbyte.o: assemble/gemm_sme_nn.S $(NN_ASM_DEPS)
-	$(CC) $(ALL_CFLAGS) -DINT8_INVERSE_SCALING_LOWBYTE_KERNEL -DASMNAME=int8_sme_gemm_kernel_nn_lowbyte -DASMFNAME=int8_sme_gemm_kernel_nn_lowbyte_ -DNAME=int8_sme_gemm_kernel_nn_lowbyte_ -DCNAME=int8_sme_gemm_kernel_nn_lowbyte -c $< -o $@
-
-assemble/gemm_sme_nn_sdiv.o: assemble/gemm_sme_nn.S $(NN_ASM_DEPS)
-	$(CC) $(ALL_CFLAGS) -DINT8_INVERSE_SCALING_SDIV_KERNEL -DASMNAME=int8_sme_gemm_kernel_nn_sdiv -DASMFNAME=int8_sme_gemm_kernel_nn_sdiv_ -DNAME=int8_sme_gemm_kernel_nn_sdiv_ -DCNAME=int8_sme_gemm_kernel_nn_sdiv -c $< -o $@
+# NN kernel -> int8_sme_gemm_kernel_nn, including the production epilogue.
+assemble/gemm_sme_nn.o: assemble/gemm_sme_nn.S $(NN_ASM_DEPS)
+	$(CC) $(ALL_CFLAGS) -DASMNAME=int8_sme_gemm_kernel_nn -DASMFNAME=int8_sme_gemm_kernel_nn_ -DNAME=int8_sme_gemm_kernel_nn_ -DCNAME=int8_sme_gemm_kernel_nn -c $< -o $@
 
 clean:
 	rm -f $(BASE_CPP_OBJS) $(BASE_ASM_OBJS) \
-	       assemble/gemm_sme_nn.o \
 	       $(TARGET) $(TEST_OBJ) $(TEST_TARGET) $(PERF_OBJ) $(PERF_TARGET) \
 	       $(HOST_TEST) $(PRODUCTION_DRIVER_TEST)
 # 快速检查
