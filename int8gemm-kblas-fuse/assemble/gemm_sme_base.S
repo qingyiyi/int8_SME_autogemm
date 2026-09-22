@@ -9,6 +9,20 @@
 
 
 #undef ZERO
+/*
+ * The generic C32 kernel stores through a byte stride (LDC = ldc * 4), while
+ * the fused NN kernel keeps the same output cursors directly in C8 bytes
+ * (LDC = ldc8).  Keep that distinction at the cursor-advance sites rather
+ * than reconstructing a C8 address for every extracted ZA vector.
+ */
+.macro ADVANCE_OUTPUT_ROWS dst,src,rows
+#ifdef INT8_INVERSE_SCALING_EPILOGUE
+	add \dst, \src, \rows
+#else
+	add \dst, \src, \rows, LSL #PRECI_WIDTH
+#endif
+.endm
+
 #ifndef SAVE_ZACOL_IMPL_
 .macro SAVE_ZACOL pc,off, reg_za,base_idx,idx,nidx,reg_pg,rab0,rc0,t0,t1
 	MOVA	\rab0\().s, \reg_pg\()/M, \reg_za\()v.s[\base_idx, \idx]
@@ -17,7 +31,7 @@
 	// stores C8 directly; it never materializes a C32 output tile.
 	INT8_INVERSE_SCALING_DIRECT \pc, \off, \reg_pg, \rab0, \rc0, \t0
 #else
-	STNT1	 \rab0\().s, \reg_pg, [\pc, \off , MUL VL]
+	STNT1	 \rab0\().s, \reg_pg, [\pc, #\off, MUL VL]
 #endif
 .endm
 #endif
@@ -25,30 +39,30 @@
 	#ldnt1w	 \rc0\().s, \reg_pg\()/z, [\pc, \off , MUL VL]
 	#fmla    \rc0\().s,\reg_pg\()/M,\rab0\().s,alpha0
 .macro SAVE_ZACOL_1VL pc,off, za0,za1,za2,za3,base_idx,idx,nidx,reg_pg0,reg_pg1,rab0,rc0,rab1,rc1,t0,t1,t2=z25,t3=z26
-	SAVE_ZACOL  \pc, #0, \za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
-	add \pc, \pc, LDC, LSL #2 // pc = pc  +  4 * ldc
+	SAVE_ZACOL  \pc, 0, \za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
+	add \pc, \pc, LDC, LSL #2 // advance by four C8 columns
 .endm
 
 .macro SAVE_ZACOL_2VL  pc,off, za0,za1,za2,za3,base_idx,idx,nidx,reg_pg0,reg_pg1,rab0,rc0,rab1,rc1,t0,t1,t2=z25,t3=z26
-	SAVE_ZACOL  \pc, #0, \za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
-	SAVE_ZACOL  \pc, #1, \za1,\base_idx,\idx,\nidx,\reg_pg1,\rab1,\rc1,\t0,\t1
-	add \pc, \pc, LDC, LSL #2 // pc = pc  +  4 * ldc
+	SAVE_ZACOL  \pc, 0, \za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
+	SAVE_ZACOL  \pc, 1, \za1,\base_idx,\idx,\nidx,\reg_pg1,\rab1,\rc1,\t0,\t1
+	add \pc, \pc, LDC, LSL #2 // advance by four C8 columns
 .endm
 
 .macro SAVE_ZACOL_3VL  pc,off, reg_za0,reg_za1,reg_za2,reg_za3,base_idx,idx,nidx,reg_pg0,reg_pg1,rab0,rc0,rab1,rc1,t0,t1,t2=z25,t3=z26
-	SAVE_ZACOL  \pc, #0, \reg_za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
-	SAVE_ZACOL  \pc, #1, \reg_za1,\base_idx,\idx,\nidx,\reg_pg0,\rab1,\rc1,\t0,\t1
-	SAVE_ZACOL  \pc, #2, \reg_za2,\base_idx,\idx,\nidx,\reg_pg1,\rab0,\rc0,\t0,\t1
-	add \pc, \pc, LDC, LSL #2 // pc = pc  +  4 * ldc
+	SAVE_ZACOL  \pc, 0, \reg_za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
+	SAVE_ZACOL  \pc, 1, \reg_za1,\base_idx,\idx,\nidx,\reg_pg0,\rab1,\rc1,\t0,\t1
+	SAVE_ZACOL  \pc, 2, \reg_za2,\base_idx,\idx,\nidx,\reg_pg1,\rab0,\rc0,\t0,\t1
+	add \pc, \pc, LDC, LSL #2 // advance by four C8 columns
 .endm
 
 #ifndef SAVE_ZACOL_4VL_IMPL_
 .macro SAVE_ZACOL_4VL  pc,off, reg_za0,reg_za1,reg_za2,reg_za3,base_idx,idx,nidx,reg_pg0,reg_pg1,rab0,rc0,rab1,rc1,t0,t1,t2=z25,t3=z26
-	SAVE_ZACOL  \pc, #0, \reg_za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
-	SAVE_ZACOL  \pc, #1, \reg_za1,\base_idx,\idx,\nidx,\reg_pg0,\rab1,\rc1,\t0,\t1
-	SAVE_ZACOL  \pc, #2, \reg_za2,\base_idx,\idx,\nidx,\reg_pg0,\t0,\t1,\rab0,\rc0
-	SAVE_ZACOL  \pc, #3, \reg_za3,\base_idx,\idx,\nidx,\reg_pg1,\t2,\t3,\rab0,\rc0
-	add \pc, \pc, LDC, LSL #2 // pc = pc  +  4 * ldc
+	SAVE_ZACOL  \pc, 0, \reg_za0,\base_idx,\idx,\nidx,\reg_pg0,\rab0,\rc0,\t0,\t1
+	SAVE_ZACOL  \pc, 1, \reg_za1,\base_idx,\idx,\nidx,\reg_pg0,\rab1,\rc1,\t0,\t1
+	SAVE_ZACOL  \pc, 2, \reg_za2,\base_idx,\idx,\nidx,\reg_pg0,\t0,\t1,\rab0,\rc0
+	SAVE_ZACOL  \pc, 3, \reg_za3,\base_idx,\idx,\nidx,\reg_pg1,\t2,\t3,\rab0,\rc0
+	add \pc, \pc, LDC, LSL #2 // advance by four C8 columns
 .endm
 #endif
 
@@ -129,7 +143,7 @@
 #endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,1VL, 1VL,za0
-	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
+	ADVANCE_OUTPUT_ROWS pC0, TMP_PTR, MIN_M
 .endm
 .macro KERNEL_SAVE_C_2VL_1VL label
 #ifdef INT8_INVERSE_SCALING_EPILOGUE
@@ -137,7 +151,7 @@
 #endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,2VL, 1VL,za0,za2
-	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
+	ADVANCE_OUTPUT_ROWS pC0, TMP_PTR, MIN_M
 .endm
 .macro KERNEL_SAVE_C_3VL_1VL label
 #ifdef INT8_INVERSE_SCALING_EPILOGUE
@@ -145,7 +159,7 @@
 #endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,3VL,1VL, za0,za2,za4
-	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
+	ADVANCE_OUTPUT_ROWS pC0, TMP_PTR, MIN_M
 .endm
 .macro KERNEL_SAVE_C_4VL_1VL label
 #ifdef INT8_INVERSE_SCALING_EPILOGUE
@@ -153,7 +167,7 @@
 #endif
 	mov TMP_PTR, pC0
 	KERNEL_SAVE_C_BASE_1VL \label,4VL,1VL,za0,za2,za4,za6
-	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
+	ADVANCE_OUTPUT_ROWS pC0, TMP_PTR, MIN_M
 .endm
 
 .macro KERNEL_SAVE_C_BASE_2VL label,mvl
@@ -172,7 +186,7 @@
 	add pC3,pC1,LDC,LSL #1
 	KERNEL_SAVE_C_BASE_1VL_ \mvl,2VL, za0,za2,za4,za6
 	KERNEL_SAVE_C_BASE_1VL \label,\mvl, 2VL,za1,za3,za5,za7
-	add pC0, TMP_PTR, MIN_M, LSL #PRECI_WIDTH
+	ADVANCE_OUTPUT_ROWS pC0, TMP_PTR, MIN_M
 .endm
 
 .macro KERNEL_SAVE_C_1VL_2VL label

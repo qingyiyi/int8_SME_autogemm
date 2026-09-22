@@ -56,18 +56,17 @@
  * Odd p means no integer input can be exactly halfway between two multiples,
  * so this is equivalent to the reference round-to-nearest inverse scaling.
  *
- * The fused NN build keeps the established kernel C/ldc traversal as a
- * virtual INT32 coordinate plane.  Its numeric base is the C8 tile origin,
- * but it is never dereferenced as C32.  Dividing its byte displacement by
- * sizeof(int32_t) maps it to the real byte displacement within C8:
+ * P3 keeps the fused kernel's C cursor and LDC in direct C8 byte coordinates:
+ * `pc` already identifies the first packed C8 result for this ZA vector group.
+ * The fixed production SME vector length is 64 bytes, so a .s vector has 16
+ * lanes and, after UZP1 x 2, its compacted C8 result occupies 16 bytes.  Thus
+ * SAVE_ZACOL offsets 0..3 map directly to pc + {0, 16, 32, 48}; they must not
+ * be used as MUL VL byte offsets, which would incorrectly step by 64 bytes.
  *
- *   dst = c8_tile + ((pc + off * VL) - c8_tile) / sizeof(int32_t)
- *
- * x4/x5/x6 are scratch after a completed tile reaches SAVE_ZACOL.  The
- * kernel's virtual C base and stride remain in their ordinary registers and
- * are not reused here.  p5/p6 are temporary save-stage predicates; p0-p4/p7
- * traversal state and p1/p2 MOVA predicates are left intact.  SAVE_ZACOL
- * passes tmp_q and tmp_mod disjoint from value in every production schedule.
+ * x4/x5/x6 are scratch after a completed tile reaches SAVE_ZACOL.  p5/p6 are
+ * temporary save-stage predicates; p0-p4/p7 traversal state and p1/p2 MOVA
+ * predicates are left intact.  SAVE_ZACOL passes tmp_q and tmp_mod disjoint
+ * from value in every production schedule.
  */
 .macro INT8_INVERSE_SCALING_DIRECT pc,off,reg_pg,value,tmp_q,tmp_mod
     // The existing 11th kernel argument is the fused-store parameter block.
@@ -84,13 +83,8 @@
 
     // P1 PREPARE already made p6.b active for exactly the low 16 packed C8
     // bytes.  reg_pg is p1 or p2 in production; all 16 .s lanes are active
-    // by the fixed M/N=2048-multiple contract.
-
-    // Map the virtual INT32 save address to the byte-addressed C8 tile.
-    addvl   x4, \pc, \off
-    sub     x4, x4, x5
-    lsr     x4, x4, #2
-    add     x4, x5, x4
+    // by the fixed M/N=2048-multiple contract.  `pc` itself is the direct C8
+    // cursor, so there is deliberately no C32-to-C8 address conversion here.
 
     // Mode zero is the established low-byte path and must not execute SDIV.
     cbz     w6, 8f
@@ -118,6 +112,23 @@
     // Keep the low byte of each corrected INT32 lane and write C8 directly.
     uzp1    \value\().h, \value\().h, \value\().h
     uzp1    \value\().b, \value\().b, \value\().b
+
+    // P3 direct C8 cursor: the fixed 64-byte SVL produces 16 packed bytes per
+    // ZA .s vector.  Keep offsets explicit so off cannot accidentally become
+    // an off * VL (64-byte) address calculation.
+.if \off == 0
+    st1b    { \value\().b }, p6, [\pc]
+.elseif \off == 1
+    add     x4, \pc, #16
     st1b    { \value\().b }, p6, [x4]
+.elseif \off == 2
+    add     x4, \pc, #32
+    st1b    { \value\().b }, p6, [x4]
+.elseif \off == 3
+    add     x4, \pc, #48
+    st1b    { \value\().b }, p6, [x4]
+.else
+    .error "unsupported fused C8 SAVE_ZACOL offset"
+.endif
 9:
 .endm

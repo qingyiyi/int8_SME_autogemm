@@ -292,7 +292,8 @@ add	offset_pfc, offset_pfc, #64
 	
 #if !defined(SMALL_SME_GEMM) && !defined(SUP_SME_GEMM)
 #ifndef INT8_INVERSE_SCALING_EPILOGUE
-	// The fused NN path passes a virtual C32 address plane; never prefetch it.
+	// The fused output is a write-only C8 stream.  Keep the legacy C32
+	// read-prefetch sequence disabled for this path.
 	PRFM PLDL1KEEP, [ptrcp]  // P=128, Q=512
 #endif
     add offset_pfc, offset_pfc, #128   // P=128, Q=512
@@ -361,7 +362,12 @@ add	offset_pfc, offset_pfc, #64
 	GET_ACTIVE_NUM_S p0, ELE_SIZE
 	GET_ACTIVE_NUM_H p0, MIN_N
 	GET_ACTIVE_NUM_H p0, MIN_M
+#ifdef INT8_INVERSE_SCALING_EPILOGUE
+	// P3: the fused path traverses the output as direct C8 bytes, so retain
+	// the caller's ldc8 byte stride exactly as passed.
+#else
 	lsl LDC,LDC,#2
+#endif
 	KERNEL_MM_LOOP_N h
 .endm
 #endif

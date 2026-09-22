@@ -90,78 +90,86 @@ void check_full_team(int threads) {
             "portable production-driver test could not create the requested OpenMP team");
 }
 
-// Model the address calculation in INT8_INVERSE_SCALING_DIRECT exactly:
+// P3 uses the kernel C cursor directly as a C8 byte cursor.  Under the fixed
+// production SVL=64 contract, one .s vector contains 16 INT32 lanes and packs
+// to 16 C8 bytes after UZP1 x 2.  Thus SAVE_ZACOL offsets 0..3 map to
+// {0, 16, 32, 48} C8 bytes, not {0, 64, 128, 192} bytes.
 //
-//   dst = c8_tile + ((pc + off * VL - c8_tile) >> 2)
-//
-// The original kernel moves pc through an INT32 (four-byte) virtual plane,
-// while the direct store writes bytes.  Exercise non-four-byte C8 strides,
-// all SAVE_ZACOL offsets, vector lengths representative of SME systems, tile
-// origins and partial final vectors.  This is intentionally an integer-only
-// test: the host cannot execute SME instructions, but it locks down the key
-// coordinate conversion independently of the driver mock below.
-void verify_virtual_word_to_c8_mapping() {
+// The original save traversal has a second, algorithmic stride: after a
+// SAVE_ZACOL_1/2/3/4VL group, pc advances by 4 * LDC.  That is four output
+// columns, not a C32 element-width conversion, so it intentionally remains in
+// P3.  This host-only arithmetic test verifies every part of the direct C8
+// cursor algebra and proves equivalence to the retired virtual-C32 mapping at
+// the one supported SVL=64.
+void verify_direct_c8_cursor_mapping() {
     constexpr uint64_t kSyntheticC8Base = UINT64_C(0x100000003);
+    constexpr BLASLONG kSmeVectorBytes = 64;
+    constexpr BLASLONG kPackedC8Bytes =
+        kSmeVectorBytes / static_cast<BLASLONG>(sizeof(int32_t));
     constexpr std::array<BLASLONG, 2> kMatrixSizes = {2048, 8192};
-    constexpr std::array<BLASLONG, 5> kVectorBytes = {16, 32, 64, 128, 256};
-    constexpr std::array<BLASLONG, 4> kRelativeRows = {0, 4, 64, 127};
-    constexpr std::array<BLASLONG, 4> kRelativeCols = {0, 1, 31, 63};
+    constexpr std::array<BLASLONG, 4> kRelativeRows = {0, 16, 64, 127};
+    constexpr std::array<BLASLONG, 4> kVectorGroups = {0, 1, 7, 15};
 
+    static_assert(kPackedC8Bytes == 16, "P3 direct-store contract requires SVL=64");
     for (const BLASLONG matrix_m : kMatrixSizes) {
         const BLASLONG ldc8 = matrix_m + 23;  // Deliberately not a 4-byte stride.
-        const std::array<BLASLONG, 5> tile_rows = {
-            0, 64, 128, matrix_m / 2, matrix_m - 128};
+        const std::array<BLASLONG, 3> tile_rows = {0, 128, matrix_m - 256};
         for (const BLASLONG matrix_n : kMatrixSizes) {
-            const std::array<BLASLONG, 4> tile_cols = {
-                0, 32, matrix_n / 2, matrix_n - 32};
+            const std::array<BLASLONG, 3> tile_cols = {0, 7, matrix_n - 128};
             for (const BLASLONG tile_row : tile_rows) {
                 for (const BLASLONG tile_col : tile_cols) {
                     const uint64_t c8_tile = kSyntheticC8Base +
                         static_cast<uint64_t>(tile_row) +
                         static_cast<uint64_t>(tile_col) * ldc8;
-                    for (const BLASLONG vector_bytes : kVectorBytes) {
-                        const BLASLONG int32_lanes = vector_bytes / 4;
-                        for (const BLASLONG relative_row : kRelativeRows) {
-                            for (const BLASLONG relative_col : kRelativeCols) {
-                                if (tile_col + relative_col >= matrix_n) continue;
-
-                                // pc is the same address that the legacy STNT1W
-                                // would have used before its [pc, off, MUL VL]
-                                // displacement was applied.
-                                const uint64_t pc = c8_tile + 4 *
-                                    (static_cast<uint64_t>(relative_row) +
-                                     static_cast<uint64_t>(relative_col) * ldc8);
+                    for (const BLASLONG relative_row : kRelativeRows) {
+                        for (const BLASLONG pC_slot : {BLASLONG{0}, BLASLONG{1},
+                                                       BLASLONG{2}, BLASLONG{3}}) {
+                            // pC0..pC3 differ by one direct C8 ldc8 stride.
+                            const uint64_t direct_pc0 = c8_tile +
+                                static_cast<uint64_t>(relative_row) +
+                                static_cast<uint64_t>(pC_slot) * ldc8;
+                            const uint64_t retired_virtual_pc0 = c8_tile + 4 *
+                                (static_cast<uint64_t>(relative_row) +
+                                 static_cast<uint64_t>(pC_slot) * ldc8);
+                            for (const BLASLONG group : kVectorGroups) {
+                                // SAVE_ZACOL_*VL retains this 4*LDC group stride.
+                                const BLASLONG col = tile_col + pC_slot + 4 * group;
+                                if (col >= matrix_n) continue;
+                                const uint64_t direct_pc = direct_pc0 +
+                                    static_cast<uint64_t>(4 * group) * ldc8;
+                                const uint64_t retired_virtual_pc = retired_virtual_pc0 +
+                                    static_cast<uint64_t>(16 * group) * ldc8;
                                 for (BLASLONG off = 0; off < 4; ++off) {
-                                    const BLASLONG global_row = tile_row + relative_row +
-                                        off * int32_lanes;
-                                    if (global_row >= matrix_m) continue;
-                                    const BLASLONG active_lanes =
-                                        std::min(int32_lanes, matrix_m - global_row);
+                                    const BLASLONG row = tile_row + relative_row +
+                                        off * kPackedC8Bytes;
+                                    if (row + kPackedC8Bytes > matrix_m) continue;
 
-                                    const uint64_t helper_dst = c8_tile +
-                                        ((pc + static_cast<uint64_t>(off) * vector_bytes -
-                                          c8_tile) >> 2);
+                                    const uint64_t direct_dst = direct_pc +
+                                        static_cast<uint64_t>(off * kPackedC8Bytes);
                                     const uint64_t expected_dst = kSyntheticC8Base +
-                                        static_cast<uint64_t>(global_row) +
-                                        static_cast<uint64_t>(tile_col + relative_col) * ldc8;
-                                    require(helper_dst == expected_dst,
-                                            "virtual word-to-C8 base-address mapping mismatch");
+                                        static_cast<uint64_t>(row) +
+                                        static_cast<uint64_t>(col) * ldc8;
+                                    require(direct_dst == expected_dst,
+                                            "direct C8 cursor base-address mapping mismatch");
 
-                                    // st1b uses a prefix byte predicate built from
-                                    // the active S lanes.  Every active byte must
-                                    // be contiguous at the expected C8 coordinate.
-                                    for (BLASLONG lane = 0; lane < active_lanes; ++lane) {
-                                        require(helper_dst + static_cast<uint64_t>(lane) ==
+                                    const uint64_t retired_dst = c8_tile +
+                                        ((retired_virtual_pc +
+                                          static_cast<uint64_t>(off * kSmeVectorBytes) -
+                                          c8_tile) >> 2);
+                                    require(direct_dst == retired_dst,
+                                            "direct C8 cursor does not match fixed-SVL legacy mapping");
+
+                                    for (BLASLONG lane = 0; lane < kPackedC8Bytes; ++lane) {
+                                        require(direct_dst + static_cast<uint64_t>(lane) ==
                                                     expected_dst + static_cast<uint64_t>(lane),
-                                                "virtual word-to-C8 vector-lane mapping mismatch");
+                                                "direct C8 cursor vector-lane mapping mismatch");
                                     }
                                     const uint64_t last_offset =
-                                        helper_dst - kSyntheticC8Base + active_lanes - 1;
-                                    require(last_offset / ldc8 ==
-                                                static_cast<uint64_t>(tile_col + relative_col) &&
-                                                    last_offset % ldc8 <
+                                        direct_dst - kSyntheticC8Base + kPackedC8Bytes - 1;
+                                    require(last_offset / ldc8 == static_cast<uint64_t>(col) &&
+                                                last_offset % ldc8 <
                                                 static_cast<uint64_t>(matrix_m),
-                                            "virtual word-to-C8 mapping touched C8 padding");
+                                            "direct C8 cursor mapping touched C8 padding");
                                 }
                             }
                         }
@@ -278,7 +286,7 @@ extern "C" void int8_sme_gemm_kernel_nn(
 
 int main() {
     try {
-        verify_virtual_word_to_c8_mapping();
+        verify_direct_c8_cursor_mapping();
         // All modes validate the C++ mode-to-modulus wiring on the serial path.
         for (unsigned mode = 0; mode <= fusion_test::kModuli.size(); ++mode) {
             run_one(mode, 1, C8Behavior::Inverse);
@@ -291,7 +299,7 @@ int main() {
         // a C++ inverse-scaling loop still runs after the kernel returns, this
         // marker would be overwritten and this call fails.
         run_one(1, 1, C8Behavior::Marker);
-        std::cout << "PASS host production-driver mock: virtual word-to-C8 address "
+        std::cout << "PASS host production-driver mock: direct C8 cursor address "
                      "mapping, C8-only API wiring, all moduli, C8 stride, padding, "
                      "1/32-thread tiling, and absence of a post-kernel C++ "
                      "inverse-scaling pass verified.\n";

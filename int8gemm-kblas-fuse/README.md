@@ -14,8 +14,8 @@
 - C8 是下游消费的最终结果。GEMM 在 ZA 中完成 INT32 累加后，汇编会从 ZA
   取出结果向量、立即 inverse scaling 并直接写 C8；生产 NN 路径不分配、不落地
   C32。生产 API 只接收最终的 `c8/ldc8` 输出参数；不存在 C32 输出指针、
-  C32 leading dimension 或 C32 offset-vector 参数。汇编内部仍使用两个既有的
-  输出寄存器槽作为虚拟四字节坐标平面，但它们绝不被当作 C32 地址解引用。
+  C32 leading dimension 或 C32 offset-vector 参数。fused NN 汇编中的既有输出
+  寄存器槽现在直接保存 C8 byte cursor，`LDC` 保持为调用方传入的 `ldc8` byte stride。
 
 不在本合同内的尺寸（例如非 2048 倍数）不应作为生产验收条件，也不要为了这些
 尺寸改动已经确认正确的 GEMM 累加、packing 或分块逻辑。
@@ -53,9 +53,9 @@ ZA 取出的 INT32 输出向量，汇编计算 `q = trunc(value / modulus)`，�
 不是计算 `1 / modulus`；因此它必须对每个输出向量执行。`modulus=0` 路径跳过
 `SDIV`，直接保留 INT32 的低字节。
 
-该实现仅改变 `MOVA ZA.S -> Z.S` 后的 inverse-scaling epilogue。MOPA、ZA
-accumulation、packing、tile traversal、C8 地址映射和最终 `UZP1 × 2 + ST1B`
-low-byte/wrap store 均保持不变。
+该实现保留 MOPA、ZA accumulation、packing 和已验证的 `SDIV + MLS` inverse-
+scaling 数学；P3 仅将 fused 输出 traversal 从虚拟 C32 坐标改成直接 C8 byte cursor，
+并保留最终 `UZP1 × 2 + ST1B` low-byte/wrap store。
 
 ### 汇编 ABI
 
@@ -73,12 +73,13 @@ low-byte/wrap store 均保持不变。
 调用开始时根据 `num_moduli` 选定这三个常量，然后为每个 NN tile 填入参数块。
 表中的 `1.0 / p` 是 `constexpr` 初始化，只在编译期求值，不会在 GEMM 调用或
 tile 循环中执行除法。
-当前 B1 的 SDIV epilogue 仍只读取 offset 0/8 的 `c8`/`modulus`，所以算法和
-结果不变；B2 才会读取 offset 16/24 的 FP64 常量并替换汇编算术。原 kernel 的
-输出遍历仍按已验证的 INT32 坐标平面推进；汇编将其字节位移除以 4，直接得到
-相对于 `c8` 的字节位移，因此不需要在参数块中重复保存 `ldc8`。这些虚拟地址
-从不被 `ldr/str` 解引用。`buf` 的实际栈位置由现有 prologue/save-area 约定
-确定，修改 kernel 参数顺序或 `SAVE_REGS` 布局时必须同步更新汇编。
+当前 SDIV epilogue 仍只读取 offset 0/8 的 `c8`/`modulus`；offset 16/24 的
+FP64 常量保留 ABI，但当前整数路径不消费它们。P3 中原 kernel 的输出 traversal
+直接按 C8 byte cursor 和未缩放的 `ldc8` 推进，不再执行每向量的 `>> 2` 地址映射。
+固定生产 SVL=64 bytes 时，一个 `.s` ZA 向量有 16 个 INT32 lane，压缩后对应 16 个
+C8 bytes，因此 `SAVE_ZACOL` offset 0..3 显式写到 `pc + {0,16,32,48}`。`buf` 的
+实际栈位置由现有 prologue/save-area 约定确定，修改 kernel 参数顺序或 `SAVE_REGS`
+布局时必须同步更新汇编。
 
 ## 本机验证（不执行 SME 汇编）
 
@@ -96,8 +97,8 @@ make -B test-host
 - INT32 累加器边界、guard/padding 和固定 K=2048 的标量参考；
 - 生产 C++ driver 的 C8 tile 地址、C8 stride、modulus/`inv_p`/`neg_p` 传递和
   1/32 线程分块；
-- 虚拟四字节 word 坐标到 C8 字节地址的 `>> 2` 转换：覆盖 2048/8192、非 4 字节对齐的
-  C8 stride、SAVE_ZACOL 的 0..3 个 VL 偏移、16..256-byte VL、tile 边界与尾向量；
+- 直接 C8 cursor 地址：覆盖 2048/8192、非 4 字节对齐的 C8 stride、tile 边界，
+  并验证在固定 64-byte SVL 下 `SAVE_ZACOL` 的 0..3 偏移对应 `0/16/32/48` bytes；
 - mock kernel 写入 marker，确认 C++ 返回后没有隐藏的 inverse-scaling pass。
 
 host 测试不具备 AArch64 SME 指令执行能力，所以不能替代目标机验收。

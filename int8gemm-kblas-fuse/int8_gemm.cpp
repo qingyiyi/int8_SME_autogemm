@@ -204,10 +204,9 @@ static void SmeGemmDriver(const SmeGemmArgs *args, FLOAT *sa, FLOAT *sb, BLASULO
                         minJJ = Jblock;
                     }
                     // K=2048 is one complete K panel for this production
-                    // contract.  Give the proven kernel traversal a virtual
-                    // C32 coordinate plane rooted at this C8 tile; the fused
-                    // assembly never dereferences it as C32 and writes C8
-                    // directly from ZA after inverse scaling.
+                    // contract.  The fused NN kernel receives this direct C8
+                    // tile cursor and its unscaled byte stride, then writes C8
+                    // immediately after inverse scaling each ZA vector.
                     int8_t *const c8_tile =
                         c8 + is + jj * static_cast<BLASLONG>(ldc8);
                     Int8FusedStoreParams store_params{};

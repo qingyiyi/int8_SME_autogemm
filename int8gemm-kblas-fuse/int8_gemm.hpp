@@ -115,11 +115,10 @@ typedef enum CBLAS_TRANSPOSE {
 
 // Production inverse-scaling store ABI.  The NN kernel receives a pointer to
 // this structure through its existing 11th (buf) argument.  `c8` is the stable
-// base of the current output tile; the kernel's C/ldc argument slots themselves
-// carry the virtual INT32 coordinate plane used by the existing traversal.  The
-// helper maps that virtual coordinate back to a byte address below `c8` and
-// never dereferences it as C32.  The virtual LDC already contains the C8 stride,
-// so duplicating ldc8 in this structure would be redundant.
+// base of the current output tile and the fused kernel C/ldc argument slots
+// begin at the same tile in direct C8 byte coordinates (`ldc8` is unscaled).
+// The assembly retains `c8` as the fused-store enable/sentinel; it no longer
+// reconstructs a byte address from a virtual C32 coordinate plane.
 struct alignas(16) Int8FusedStoreParams {
     int8_t *c8;         // column-major INT8 tile origin
     int32_t modulus;    // 0: low byte; otherwise centered remainder modulus
@@ -139,9 +138,8 @@ static_assert(offsetof(Int8FusedStoreParams, neg_p) == 24,
 static_assert(sizeof(Int8FusedStoreParams) == 32, "fused ABI size");
 
 extern "C" {
-    // These two output arguments are C8 storage, even though the unchanged
-    // assembly traversal internally treats their addresses as a virtual
-    // four-byte accumulator coordinate plane.
+    // These two output arguments are the direct C8 output cursor and its
+    // unscaled C8 byte stride in the fused NN build.
     void int8_sme_gemm_kernel_nn(
         BLASLONG m, BLASLONG n, BLASLONG k,
         void *sa, BLASLONG lda, float alpha,
