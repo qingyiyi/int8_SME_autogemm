@@ -1,7 +1,7 @@
 // Portable production-driver test.  It replaces the target-only packers and
-// SME kernel with strict mocks, so it verifies that the original
-// cblas_gemm_s8s8s8() driver passes the C8-only fused-store ABI to the
-// original NN kernel symbol.  It does NOT execute AArch64 SME assembly.
+// SME kernels with strict mocks, so it verifies that cblas_gemm_s8s8s8()
+// passes the C8-only fused-store ABI to the correct P2 NN specialization.  It
+// does NOT execute AArch64 SME assembly.
 #include "tests/reference.hpp"
 #include "int8_gemm.hpp"
 
@@ -30,6 +30,7 @@ constexpr int8_t kC8Padding = static_cast<int8_t>(-91);
 constexpr int8_t kKernelMarker = static_cast<int8_t>(91);
 
 enum class C8Behavior { Inverse, Marker };
+enum class KernelPath { LowByte, Sdiv };
 
 struct Invocation {
     int8_t* c8 = nullptr;
@@ -38,6 +39,8 @@ struct Invocation {
     std::atomic<size_t> pack_a_calls{0};
     std::atomic<size_t> pack_b_calls{0};
     std::atomic<size_t> kernel_calls{0};
+    std::atomic<size_t> lowbyte_kernel_calls{0};
+    std::atomic<size_t> sdiv_kernel_calls{0};
     std::atomic<bool> invalid{false};
 };
 
@@ -205,6 +208,12 @@ void run_one(unsigned mode, int threads, C8Behavior c8_behavior) {
             "unexpected B-pack call count");
     require(invocation.kernel_calls.load() == expected_kernel_calls,
             "unexpected production-kernel call count");
+    require(invocation.lowbyte_kernel_calls.load() ==
+                (mode == 0 ? expected_kernel_calls : 0),
+            "mode-specialized low-byte kernel dispatch mismatch");
+    require(invocation.sdiv_kernel_calls.load() ==
+                (mode == 0 ? 0 : expected_kernel_calls),
+            "mode-specialized SDIV kernel dispatch mismatch");
 
     for (int col = 0; col < kN; ++col) {
         for (int row = 0; row < kM; ++row) {
@@ -228,21 +237,7 @@ void run_one(unsigned mode, int threads, C8Behavior c8_behavior) {
     require(a == original_a && b == original_b,
             "production driver modified an input matrix");
 }
-}  // namespace
-
-extern "C" void int8_sme_gemm_itcopy(
-    const BLASLONG, const BLASLONG, const BLASINT8*, const BLASLONG,
-    BLASINT8*, BLASINT8) {
-    if (g_invocation != nullptr) ++g_invocation->pack_a_calls;
-}
-
-extern "C" void int8_sme_gemm_oncopy(
-    const BLASLONG, const BLASLONG, const BLASINT8*, const BLASLONG,
-    BLASINT8*, BLASINT8) {
-    if (g_invocation != nullptr) ++g_invocation->pack_b_calls;
-}
-
-extern "C" void int8_sme_gemm_kernel_nn(
+void mock_kernel(KernelPath path,
     BLASLONG rows, BLASLONG cols, BLASLONG k, void*, BLASLONG, float alpha,
     void*, BLASLONG, int8_t* c8, BLASLONG ldc8, void* buf) {
     Invocation* invocation = g_invocation;
@@ -252,7 +247,11 @@ extern "C" void int8_sme_gemm_kernel_nn(
     const Int8FusedStoreParams expected = invocation != nullptr
         ? expected_scaling(invocation->mode)
         : Int8FusedStoreParams{};
-    if (invocation == nullptr || params == nullptr || k != kK || alpha != 1.0f ||
+    const KernelPath expected_path = invocation != nullptr && invocation->mode == 0
+        ? KernelPath::LowByte
+        : KernelPath::Sdiv;
+    if (invocation == nullptr || params == nullptr || path != expected_path ||
+        k != kK || alpha != 1.0f ||
         params->c8 != c8 || ldc8 != kLdc8 ||
         params->modulus != expected.modulus || params->reserved != 0 ||
         params->inv_p != expected.inv_p || params->neg_p != expected.neg_p ||
@@ -273,7 +272,40 @@ extern "C" void int8_sme_gemm_kernel_nn(
                     : kKernelMarker;
         }
     }
+    if (path == KernelPath::LowByte) {
+        ++invocation->lowbyte_kernel_calls;
+    } else {
+        ++invocation->sdiv_kernel_calls;
+    }
     ++invocation->kernel_calls;
+}
+
+}  // namespace
+
+extern "C" void int8_sme_gemm_itcopy(
+    const BLASLONG, const BLASLONG, const BLASINT8*, const BLASLONG,
+    BLASINT8*, BLASINT8) {
+    if (g_invocation != nullptr) ++g_invocation->pack_a_calls;
+}
+
+extern "C" void int8_sme_gemm_oncopy(
+    const BLASLONG, const BLASLONG, const BLASINT8*, const BLASLONG,
+    BLASINT8*, BLASINT8) {
+    if (g_invocation != nullptr) ++g_invocation->pack_b_calls;
+}
+
+extern "C" void int8_sme_gemm_kernel_nn_lowbyte(
+    BLASLONG rows, BLASLONG cols, BLASLONG k, void* sa, BLASLONG lda, float alpha,
+    void* sb, BLASLONG ldb, int8_t* c8, BLASLONG ldc8, void* buf) {
+    mock_kernel(KernelPath::LowByte, rows, cols, k, sa, lda, alpha, sb, ldb,
+                c8, ldc8, buf);
+}
+
+extern "C" void int8_sme_gemm_kernel_nn_sdiv(
+    BLASLONG rows, BLASLONG cols, BLASLONG k, void* sa, BLASLONG lda, float alpha,
+    void* sb, BLASLONG ldb, int8_t* c8, BLASLONG ldc8, void* buf) {
+    mock_kernel(KernelPath::Sdiv, rows, cols, k, sa, lda, alpha, sb, ldb,
+                c8, ldc8, buf);
 }
 
 int main() {
@@ -292,9 +324,9 @@ int main() {
         // marker would be overwritten and this call fails.
         run_one(1, 1, C8Behavior::Marker);
         std::cout << "PASS host production-driver mock: virtual word-to-C8 address "
-                     "mapping, C8-only API wiring, all moduli, C8 stride, padding, "
-                     "1/32-thread tiling, and absence of a post-kernel C++ "
-                     "inverse-scaling pass verified.\n";
+                     "mapping, mode-specialized kernel dispatch, C8-only API wiring, "
+                     "all moduli, C8 stride, padding, 1/32-thread tiling, and absence "
+                     "of a post-kernel C++ inverse-scaling pass verified.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL host production-driver mock: " << error.what() << '\n';

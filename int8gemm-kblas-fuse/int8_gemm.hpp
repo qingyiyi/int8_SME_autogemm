@@ -139,10 +139,19 @@ static_assert(offsetof(Int8FusedStoreParams, neg_p) == 24,
 static_assert(sizeof(Int8FusedStoreParams) == 32, "fused ABI size");
 
 extern "C" {
-    // These two output arguments are C8 storage, even though the unchanged
-    // assembly traversal internally treats their addresses as a virtual
-    // four-byte accumulator coordinate plane.
-    void int8_sme_gemm_kernel_nn(
+    // Internal P2 assembly entry points.  The public API remains
+    // cblas_gemm_s8s8s8(); the C++ driver chooses lowbyte for mode 0 and sdiv
+    // for modes 1..19 once before entering its tile loops.  These two output
+    // arguments are C8 storage, even though the unchanged assembly traversal
+    // internally treats their addresses as a virtual four-byte accumulator
+    // coordinate plane.
+    void int8_sme_gemm_kernel_nn_lowbyte(
+        BLASLONG m, BLASLONG n, BLASLONG k,
+        void *sa, BLASLONG lda, float alpha,
+        void *sb, BLASLONG ldb,
+        int8_t *c8, BLASLONG ldc8, void *store_params
+    );
+    void int8_sme_gemm_kernel_nn_sdiv(
         BLASLONG m, BLASLONG n, BLASLONG k,
         void *sa, BLASLONG lda, float alpha,
         void *sb, BLASLONG ldb,

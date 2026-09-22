@@ -22,7 +22,8 @@
 
 ## 生产实现
 
-现在只有一条 C8-only 生产 API/内核路径：
+现在只有一条 C8-only 生产 API 路径；P2 在这条路径内部使用两个按 mode
+静态专用的 NN 汇编 kernel：
 
 ```text
 cblas_gemm_s8s8s8(..., sa, sb, c8, ldc8, num_moduli)
@@ -35,23 +36,26 @@ cblas_gemm_s8s8s8(..., sa, sb, c8, ldc8, num_moduli)
 `int8_gemm.cpp` 不再包含 C++ inverse-scaling 双重循环，也不再包含浮点
 `rint/fma` 计算。它只负责：
 
-1. 在一次 GEMM 调用开始时按 `num_moduli` 选择 `modulus/inv_p/neg_p`；
+1. 按 `num_moduli` 选择 `modulus/inv_p/neg_p`，并在一次 public GEMM 调用开始时
+   选择 `lowbyte`（mode 0）或 `sdiv`（mode 1..19）内部 kernel；
 2. 为当前 GEMM tile 填充 `Int8FusedStoreParams`；
-3. 通过原 NN kernel 的既有 `buf` 参数把该结构传给汇编。
+3. 通过该 kernel 的既有 `buf` 参数把结构传给汇编。
 
-B1 已经完成上述常量的外提和 ABI 传递，但当前汇编仍使用原来已验证的
-`SDIV + MLS` 路径；因此 B1 的目标是改变参数准备，不是改变结果算法或性能。
+B1 已完成常量的外提和 ABI 传递；P2 则把原先每个输出向量上的 mode 分支移到
+C++ tile 循环之前。它不改变 nonzero mode 已验证的 `SDIV + MLS` 数学，也不引入
+此前性能较差的 Z 寄存器常量 preload。
 
-inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`，并由生产
-`assemble/gemm_sme_nn.S` 包含到 `int8_sme_gemm_kernel_nn`。汇编在每个 ZA
-结果向量刚被 `MOVA` 取出后完成 inverse scaling，再用原有的 `UZP1 × 2 + ST1B`
-直接写 C8；`modulus=0` 路径直接写该 INT32 向量的低字节。
+inverse-scaling 算术位于 `assemble/gemm_sme_inverse_scaling.S`。Makefile 从同一个
+生产源 `assemble/gemm_sme_nn.S` 编译出
+`int8_sme_gemm_kernel_nn_lowbyte` 与 `int8_sme_gemm_kernel_nn_sdiv`；没有复制或新增
+`.S` 文件。汇编在每个 ZA 结果向量刚被 `MOVA` 取出后完成 inverse scaling，再用原有
+的 `UZP1 × 2 + ST1B` 直接写 C8；low-byte kernel 直接写该 INT32 向量的低字节。
 
 非零 modulus 的 quotient 使用已验证的 signed vector `SDIV` 实现。对每个刚从
 ZA 取出的 INT32 输出向量，汇编计算 `q = trunc(value / modulus)`，再用 `MLS`
 重构余数并修正到 centered-remainder 区间。这里的 `SDIV` 分子是当前输出元素，
-不是计算 `1 / modulus`；因此它必须对每个输出向量执行。`modulus=0` 路径跳过
-`SDIV`，直接保留 INT32 的低字节。
+不是计算 `1 / modulus`；因此它必须对每个输出向量执行。P2 的 low-byte 专用
+kernel 根本不装载 `modulus`，也不包含 `SDIV`、`MLS` 或 per-vector `cbz w6`。
 
 该实现仅改变 `MOVA ZA.S -> Z.S` 后的 inverse-scaling epilogue。MOPA、ZA
 accumulation、packing、tile traversal、C8 地址映射和最终 `UZP1 × 2 + ST1B`
@@ -151,7 +155,8 @@ oracle 验证 C8。
 第一处汇编/链接错误。优先确认：
 
 - 执行的是 `make clean && make -B test`；
-- `nm test_kblas_gemm | grep int8_sme_gemm_kernel_nn` 存在生产 NN 符号；
+- `nm test_kblas_gemm | grep -E 'int8_sme_gemm_kernel_nn_(lowbyte|sdiv)$'`
+  同时存在两个生产 NN 符号；
 - SVE VL/SME SVL 均为 64 bytes；
 - OpenMP 确实创建 32 个线程；
 - 进程保持 `FE_TONEAREST`。
@@ -160,7 +165,8 @@ oracle 验证 C8。
 
 - `int8_gemm.cpp`：原生产 driver；只新增汇编 epilogue 所需的 tile 参数传递。
 - `int8_gemm.hpp`：kernel 声明和 C++/汇编共享 ABI。
-- `assemble/gemm_sme_nn.S`：生产 NN 符号入口。
+- `assemble/gemm_sme_nn.S`：生产 NN 源入口；同一文件编译为 low-byte 与 SDIV 两个
+  内部符号。
 - `assemble/gemm_sme_inverse_scaling.S`：inverse-scaling epilogue。
 - `test_int8gemm_kblas.cpp`：目标机生产路径验收程序。
 - `tests/test_reference.cpp`、`tests/reference.hpp`：可移植 reference/oracle。
